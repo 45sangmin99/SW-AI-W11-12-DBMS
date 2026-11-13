@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
            ",\"delete_storage_bytes\":%" PRIu64
            ",\"reopen_recovery_index_s\":%.9f,\"bpt_incremental_shuffle_"
            "s\":%.9f,\"bpt_bulk_shuffle_s\":%.9f,\"bpt_incremental_bytes\":%zu,\"bpt_bulk_bytes\":%"
-           "zu,\"maxrss_platform_units\":%ld}\n",
+           "zu,\"maxrss_platform_units\":%ld",
            count, batch_size, transaction_count, phase_wall, begin_time, empty_open, insert, commit,
            after.storage_write_s - before.storage_write_s,
            after.index_build_s - before.index_build_s, after.wal_sync_s - before.wal_sync_s,
@@ -197,5 +197,22 @@ int main(int argc, char **argv) {
            delete_after.storage_bytes - update_after.storage_bytes,
            reopen, incremental, bulk, memory, bulk_memory,
            ru.ru_maxrss);
+    printf(",\"stages\":{\"prepare_s\":%.9f,\"wal_records_s\":%.9f,"
+           "\"data_sync_s\":%.9f,\"directory_sync_s\":%.9f,\"publish_s\":%.9f,"
+           "\"completion_s\":%.9f,\"commit_sync_s\":%.9f}",
+           after.prepare_s-before.prepare_s, after.wal_records_s-before.wal_records_s,
+           after.data_sync_s-before.data_sync_s, after.directory_sync_s-before.directory_sync_s,
+           after.publish_s-before.publish_s, after.completion_s-before.completion_s,
+           after.commit_sync_s-before.commit_sync_s);
+#ifdef MDB_PROFILE
+    printf(",\"syscalls\":{\"wal_write_s\":%.9f,\"wal_write_calls\":%" PRIu64
+           ",\"wal_write_bytes\":%" PRIu64 ",\"data_pwrite_s\":%.9f,"
+           "\"data_pwrite_calls\":%" PRIu64 ",\"data_pwrite_bytes\":%" PRIu64 "}",
+           after.wal_write_s-before.wal_write_s, after.wal_write_calls-before.wal_write_calls,
+           after.wal_write_bytes-before.wal_write_bytes, after.data_pwrite_s-before.data_pwrite_s,
+           after.data_pwrite_calls-before.data_pwrite_calls,
+           after.data_pwrite_bytes-before.data_pwrite_bytes);
+#endif
+    puts("}");
     return 0;
 }

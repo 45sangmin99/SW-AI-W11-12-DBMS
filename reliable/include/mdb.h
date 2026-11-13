@@ -127,6 +127,10 @@ int mdb_transaction_status(mdb_db *db, uint64_t txid);
 typedef struct {
     double storage_write_s, index_build_s, wal_sync_s, recovery_s;
     uint64_t storage_bytes;
+    /* Coarse commit stages; syscall timings/counts require MDB_PROFILE. */
+    double prepare_s, wal_records_s, wal_write_s, data_pwrite_s, data_sync_s;
+    double directory_sync_s, publish_s, completion_s, commit_sync_s;
+    uint64_t wal_write_calls, wal_write_bytes, data_pwrite_calls, data_pwrite_bytes;
 } mdb_metrics;
 void mdb_get_metrics(mdb_db *db, mdb_metrics *out);
 #ifdef MDB_TESTING

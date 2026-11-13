@@ -396,12 +396,24 @@ static int full_pread(int fd, void *data, size_t n, uint64_t offset) {
     }
     return 0;
 }
-static int full_pwrite(int fd, const void *data, size_t n, uint64_t offset) {
+static int full_pwrite(mdb_db *db, int fd, const void *data, size_t n, uint64_t offset) {
+    (void)db;
     const unsigned char *p = data;
     if (offset > (uint64_t)INT64_MAX || n > (uint64_t)INT64_MAX - offset)
         return -1;
     while (n) {
+#ifdef MDB_PROFILE
+        double syscall_started = seconds();
+#endif
         ssize_t k = pwrite(fd, p, n, (off_t)offset);
+#ifdef MDB_PROFILE
+        int syscall_errno = errno;
+        db->metrics.data_pwrite_s += seconds() - syscall_started;
+        errno = syscall_errno;
+        db->metrics.data_pwrite_calls++;
+        if (k > 0)
+            db->metrics.data_pwrite_bytes += (uint64_t)k;
+#endif
         if (k < 0 && errno == EINTR)
             continue;
         if (k <= 0)
@@ -1117,6 +1129,32 @@ done:
 /* WAL v1: 32-byte LE header: magic/type/length/payload-checksum/txid,
  * independent header-checksum and reserved zero. Checksums are low32(FNV64).
  * Header integrity is verified BEFORE trusting length or truncating a tail. */
+/* Instrument the actual write syscall, including retries. Production builds
+ * retain the original full_write path to quantify profiling overhead. */
+static int wal_write(mdb_db *db, const void *data, size_t n) {
+#ifndef MDB_PROFILE
+    return full_write(db->walfd, data, n);
+#else
+    const unsigned char *p = data;
+    while (n) {
+        double started = seconds();
+        ssize_t k = write(db->walfd, p, n);
+        int syscall_errno = errno;
+        db->metrics.wal_write_s += seconds() - started;
+        errno = syscall_errno;
+        db->metrics.wal_write_calls++;
+        if (k > 0)
+            db->metrics.wal_write_bytes += (uint64_t)k;
+        if (k < 0 && errno == EINTR)
+            continue;
+        if (k <= 0)
+            return -1;
+        p += (size_t)k;
+        n -= (size_t)k;
+    }
+    return 0;
+#endif
+}
 static int wal_append(mdb_db *db, uint32_t kind, uint64_t txid, const unsigned char *payload,
                       size_t n) {
     if (n > RECORD_MAX)
@@ -1128,13 +1166,13 @@ static int wal_append(mdb_db *db, uint32_t kind, uint64_t txid, const unsigned c
     put32(h + 12, (uint32_t)hashbytes(FNV_INIT, payload, n));
     put64(h + 16, txid);
     put32(h + 24, (uint32_t)hashbytes(FNV_INIT, h, 24));
-    if (full_write(db->walfd, h, sizeof h))
+    if (wal_write(db, h, sizeof h))
         return -1;
     const char *fp = getenv("MDB_FAILPOINT"), *io = getenv("MDB_IO_FAIL");
     if (kind == LOG_ROW &&
         ((fp && strcmp(fp, "wal_partial") == 0) || (io && strcmp(io, "wal_write") == 0))) {
         if (n)
-            (void)full_write(db->walfd, payload, n / 2);
+            (void)wal_write(db, payload, n / 2);
         fault("wal_partial");
         errno = EIO;
         return -1;
@@ -1143,7 +1181,7 @@ static int wal_append(mdb_db *db, uint32_t kind, uint64_t txid, const unsigned c
         errno = EIO;
         return -1;
     }
-    return full_write(db->walfd, payload, n);
+    return wal_write(db, payload, n);
 }
 static int reserve_txid(mdb_db *db, uint64_t *id, mdb_error *e) {
     if (!db->txnext || db->txnext > INT64_MAX)
@@ -2606,11 +2644,11 @@ static int apply_table(mdb_db *db, transaction *tx, snapshot *next, size_t ti) {
         uint64_t offset = MDB_BIN_HEADER_SIZE + (uint64_t)c->slot * size;
         const char *fp = getenv("MDB_FAILPOINT"), *io = getenv("MDB_IO_FAIL");
         if ((fp && !strcmp(fp, "binary_partial")) || (io && !strcmp(io, "binary_write"))) {
-            (void)full_pwrite(f->fd, buffer, size / 2, offset);
+            (void)full_pwrite(db, f->fd, buffer, size / 2, offset);
             fault("binary_partial");
             goto done;
         }
-        if (full_pwrite(f->fd, buffer, size, offset))
+        if (full_pwrite(db, f->fd, buffer, size, offset))
             goto done;
         db->metrics.storage_bytes += size;
         if (c->inserted) {
@@ -2625,7 +2663,10 @@ static int apply_table(mdb_db *db, transaction *tx, snapshot *next, size_t ti) {
                 goto done;
         }
     }
-    if (syncfd(f->fd))
+    double sync_started = seconds();
+    int sync_result = syncfd(f->fd);
+    db->metrics.data_sync_s += seconds() - sync_started;
+    if (sync_result)
         goto done;
     rc = 0;
 done:
@@ -2660,9 +2701,12 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
         fail(&out->error, MDB_NOMEM, "Allocation failed");
         goto done;
     }
+    double stage_started = seconds();
     next = prepare_commit(db, tx, &out->error);
+    db->metrics.prepare_s += seconds() - stage_started;
     if (!next)
         goto done;
+    stage_started = seconds();
     unsigned char begin[8];
     put64(begin, tx->snap->version);
     if (wal_append(db, LOG_BEGIN, tx->id, begin, 8))
@@ -2687,12 +2731,14 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     put64(commit + 16, next->version);
     if (wal_append(db, LOG_COMMIT, tx->id, commit, sizeof commit))
         goto unknown;
+    db->metrics.wal_records_s += seconds() - stage_started;
     fault("before_commit_sync");
     const char *io = getenv("MDB_IO_FAIL");
     double wal_started = seconds();
     if ((io && strcmp(io, "wal_fsync") == 0) || syncfd(db->walfd))
         goto unknown;
     db->metrics.wal_sync_s += seconds() - wal_started;
+    db->metrics.commit_sync_s += seconds() - wal_started;
     out->commit = MDB_DURABLE;
     db->committed[db->ncommitted++] = tx->id;
     fault("after_commit_sync");
@@ -2702,17 +2748,24 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
                 goto durable_failure;
             fault("after_binary_write");
         }
-    if (syncfd(db->dirfd))
+    stage_started = seconds();
+    int directory_synced = syncfd(db->dirfd);
+    db->metrics.directory_sync_s += seconds() - stage_started;
+    if (directory_synced)
         goto durable_failure;
+    stage_started = seconds();
     snapshot *old = db->current;
     db->current = next;
     next = NULL;
     snapshot_drop(db, old);
+    db->metrics.publish_s += seconds() - stage_started;
     fault("before_applied");
+    stage_started = seconds();
     wal_started = seconds();
     if (wal_append(db, LOG_APPLIED, tx->id, NULL, 0) || syncfd(db->walfd))
         goto durable_failure;
     db->metrics.wal_sync_s += seconds() - wal_started;
+    db->metrics.completion_s += seconds() - stage_started;
     rc = 0;
     goto done;
 unknown:
