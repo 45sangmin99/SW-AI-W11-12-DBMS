@@ -116,6 +116,11 @@ static void test_grouping(void) {
     parse_bad(too_many, MDB_LIMIT);
 }
 static void test_precedence_and_candidates(void) {
+    mdb_stmt *alias = parse_ok("SELECT name AS label,COUNT(*) AS n FROM t GROUP BY name ORDER BY n DESC");
+    assert(!strcmp(alias->aliases[0], "label") && !strcmp(alias->aliases[1], "n"));
+    mdb_stmt_free(alias);
+    parse_bad("SELECT name AS FROM t", MDB_SYNTAX);
+    parse_bad("SELECT name AS n,attack AS n FROM t", MDB_SYNTAX);
     mdb_stmt *s = parse_ok("SELECT * FROM t WHERE id=3 OR attack=2 AND name='x'");
     int64_t id = 0;
     assert(s->where->kind == MDB_OR && s->where->right->kind == MDB_AND);
@@ -157,7 +162,6 @@ static void test_errors(void) {
                              "SELECT count(id) FROM t",
                              "SELECT COUNT() FROM t",
                              "SELECT COUNT(**) FROM t",
-                             "SELECT COUNT(*) AS n FROM t",
                              "SELECT COUNT(*) n FROM t",
                              "SELECT SUM(*) FROM t",
                              "SELECT AVG(attack) FROM t",

@@ -419,8 +419,9 @@ static int select_item(parser *p, char **column, int *count) {
 }
 static int select_list(parser *p, mdb_stmt *s) {
     s->columns = allocate(p, MDB_COL_MAX * sizeof(*s->columns));
+    s->aliases = allocate(p, MDB_COL_MAX * sizeof(*s->aliases));
     s->column_counts = allocate(p, MDB_COL_MAX * sizeof(*s->column_counts));
-    if (!s->columns || !s->column_counts)
+    if (!s->columns || !s->column_counts || !s->aliases)
         return 0;
     do {
         if (s->ncolumns == MDB_COL_MAX)
@@ -428,6 +429,15 @@ static int select_list(parser *p, mdb_stmt *s) {
         int count;
         if (!select_item(p, &s->columns[s->ncolumns], &count))
             return 0;
+        if (keyword(p, "as")) {
+            advance(p);
+            s->aliases[s->ncolumns] = identifier(p);
+            if (p->failed)
+                return 0;
+            for (size_t i = 0; i < s->ncolumns; i++)
+                if (s->aliases[i] && !strcmp(s->aliases[i], s->aliases[s->ncolumns]))
+                    return fail(p, MDB_SYNTAX, p->current.offset, "Duplicate SELECT alias");
+        }
         s->column_counts[s->ncolumns++] = (unsigned char)count;
     } while (take(p, T_COMMA));
     s->count = s->ncolumns == 1 && s->column_counts[0];

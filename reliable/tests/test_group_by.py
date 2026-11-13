@@ -52,6 +52,14 @@ def cli_cases(path):
         return results[-1]
 
     ordered = name_counts(DATA)
+    query("SELECT name AS song_id,COUNT(*) AS play_count FROM characters "
+          "WHERE attack>=-9223372036854775808 AND attack<9223372036854775807 "
+          "GROUP BY name ORDER BY play_count DESC,song_id",
+          name_counts([r for r in DATA if r[1] < (1 << 63)-1]), ["song_id", "play_count"])
+    query("SELECT name AS label FROM characters ORDER BY label LIMIT 1",
+          [[min(name for name, _ in DATA)]], ["label"])
+    query("SELECT COUNT(*) AS total FROM characters ORDER BY total DESC",
+          [[str(len(DATA))]], ["total"])
     query("SELECT name,COUNT(*) FROM characters GROUP BY name "
           "ORDER BY COUNT(*) DESC,name ASC", ordered, ["name", "count"])
     query("SELECT COUNT(*),name FROM characters GROUP BY name "
@@ -118,7 +126,6 @@ def cli_cases(path):
         "SELECT name FROM characters GROUP BY COUNT(*)",
         "SELECT name,COUNT(*) FROM characters GROUP BY name HAVING COUNT(*)>1",
         "SELECT name,SUM(attack) FROM characters GROUP BY name",
-        "SELECT name AS label,COUNT(*) FROM characters GROUP BY name",
     ]
     for sql in rejected:
         process, results = run(path, sql, check=False)
@@ -319,7 +326,20 @@ def randomized_cases():
             assert result["rows"] == wanted, (index, statements[index], result, wanted)
 
 
+def play_history_alias_case():
+    with tempfile.TemporaryDirectory(prefix="mdb-play-count-") as directory:
+        path = pathlib.Path(directory)
+        (path / "play_history.schema").write_text("id INT AUTO\nsong_id INT\ncompleted_at INT\n")
+        (path / "play_history.csv").write_text("1,10,100\n2,10,120\n3,20,110\n4,20,200\n5,20,99\n")
+        _, result = run(path, "SELECT song_id, COUNT(*) AS play_count FROM play_history "
+                        "WHERE completed_at >= 100 AND completed_at < 200 "
+                        "GROUP BY song_id ORDER BY play_count DESC;")
+        assert result[-1]["rows"] == [["10", "2"], ["20", "1"]], result
+        assert [c["name"] for c in result[-1]["columns"]] == ["song_id", "play_count"]
+
+
 def main():
+    play_history_alias_case()
     with tempfile.TemporaryDirectory(prefix="mdb-group-by-") as directory:
         path = pathlib.Path(directory)
         seed(path)

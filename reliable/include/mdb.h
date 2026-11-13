@@ -72,6 +72,7 @@ typedef struct {
     char *table;
     char **columns;
     size_t ncolumns;
+    char **aliases; /* Explicit SELECT AS aliases; ORDER BY resolves these first. */
     unsigned char *column_counts; /* SELECT item flags; COUNT(*) has name "count". */
     mdb_value *values;
     size_t nvalues;

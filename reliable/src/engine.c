@@ -2107,6 +2107,10 @@ static int group_prepare(mdb_db *db, const tabledef *t, const mdb_stmt *st,
             out->columns[i] = strdup(t->cols[col].name);
             out->types[i] = t->cols[col].type;
         }
+        if (!st->star && st->aliases && st->aliases[i]) {
+            free(out->columns[i]);
+            out->columns[i] = strdup(st->aliases[i]);
+        }
         if (!out->columns[i])
             return fail(&out->error, MDB_NOMEM, "Allocation failed");
     }
@@ -2273,6 +2277,10 @@ static int result_columns(mdb_result *out, const tabledef *t, const mdb_stmt *st
             out->columns[i] = strdup(t->cols[col].name);
             out->types[i] = t->cols[col].type;
         }
+        if (!st->star && st->aliases && st->aliases[i]) {
+            free(out->columns[i]);
+            out->columns[i] = strdup(st->aliases[i]);
+        }
         if (!out->columns[i])
             return fail(&out->error, MDB_NOMEM, "Allocation failed");
     }
@@ -2295,6 +2303,25 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     tabledef *t = &db->defs[ti];
     if (expr_valid(t, st->where, &out->error))
         return -1;
+    /* Resolve output aliases only in ORDER BY, never WHERE or GROUP BY.
+     * The AST arena owns strings; these temporary order items borrow them. */
+    mdb_stmt resolved = *st;
+    mdb_order orders[MDB_COL_MAX];
+    if (st->norder) {
+        memcpy(orders, st->order, st->norder * sizeof *orders);
+        for (size_t i = 0; i < st->norder; i++) {
+            if (orders[i].count)
+                continue;
+            for (size_t j = 0; j < st->ncolumns; j++)
+                if (st->aliases && st->aliases[j] && !strcmp(orders[i].column, st->aliases[j])) {
+                    orders[i].column = st->columns[j];
+                    orders[i].count = st->column_counts && st->column_counts[j];
+                    break;
+                }
+        }
+        resolved.order = orders;
+        st = &resolved;
+    }
     group_plan grouped = {0};
     int positions[MDB_COL_MAX] = {0};
     if (st->ngroup_by) {
