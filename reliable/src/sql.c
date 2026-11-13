@@ -399,19 +399,46 @@ static int column_list(parser *p, mdb_stmt *s) {
     } while (take(p, T_COMMA));
     return !p->failed;
 }
+/* COUNT is also a legal ordinary identifier. Only a following '(' turns it
+ * into an aggregate expression, and this grammar accepts only COUNT(*). */
+static int select_item(parser *p, char **column, int *count) {
+    *count = 0;
+    *column = identifier(p);
+    if (!*column)
+        return 0;
+    if (p->current.kind != T_LP)
+        return 1;
+    if (strcmp(*column, "count"))
+        return fail(p, MDB_SYNTAX, p->current.offset, "Only COUNT(*) is supported");
+    advance(p);
+    if (!require(p, T_STAR, "Only COUNT(*) is supported") ||
+        !require(p, T_RP, "Expected ')' after COUNT(*)"))
+        return 0;
+    *count = 1;
+    return !p->failed;
+}
+static int select_list(parser *p, mdb_stmt *s) {
+    s->columns = allocate(p, MDB_COL_MAX * sizeof(*s->columns));
+    s->column_counts = allocate(p, MDB_COL_MAX * sizeof(*s->column_counts));
+    if (!s->columns || !s->column_counts)
+        return 0;
+    do {
+        if (s->ncolumns == MDB_COL_MAX)
+            return fail(p, MDB_LIMIT, p->current.offset, "Column limit exceeded");
+        int count;
+        if (!select_item(p, &s->columns[s->ncolumns], &count))
+            return 0;
+        s->column_counts[s->ncolumns++] = (unsigned char)count;
+    } while (take(p, T_COMMA));
+    s->count = s->ncolumns == 1 && s->column_counts[0];
+    return !p->failed;
+}
 static void parse_select(parser *p, mdb_stmt *s) {
     s->kind = MDB_SELECT;
     advance(p);
     if (take(p, T_STAR))
         s->star = 1;
-    else if (keyword(p, "count")) {
-        s->count = 1;
-        advance(p);
-        if (!require(p, T_LP, "Expected '(' after COUNT") ||
-            !require(p, T_STAR, "Only COUNT(*) is supported") ||
-            !require(p, T_RP, "Expected ')' after COUNT(*)"))
-            return;
-    } else if (!column_list(p, s))
+    else if (!select_list(p, s))
         return;
     if (!require_word(p, "from"))
         return;
@@ -421,6 +448,24 @@ static void parse_select(parser *p, mdb_stmt *s) {
     if (keyword(p, "where")) {
         advance(p);
         s->where = expression(p);
+    }
+    if (keyword(p, "group")) {
+        advance(p);
+        if (!require_word(p, "by"))
+            return;
+        s->group_by = allocate(p, MDB_COL_MAX * sizeof(*s->group_by));
+        if (!s->group_by)
+            return;
+        do {
+            if (s->ngroup_by == MDB_COL_MAX) {
+                (void)fail(p, MDB_LIMIT, p->current.offset, "GROUP BY column limit exceeded");
+                return;
+            }
+            char *column = identifier(p);
+            if (!column)
+                return;
+            s->group_by[s->ngroup_by++] = column;
+        } while (take(p, T_COMMA));
     }
     if (keyword(p, "order")) {
         advance(p);
@@ -435,8 +480,7 @@ static void parse_select(parser *p, mdb_stmt *s) {
                 return;
             }
             mdb_order *order = &s->order[s->norder++];
-            order->column = identifier(p);
-            if (p->failed)
+            if (!select_item(p, &order->column, &order->count))
                 return;
             if (keyword(p, "asc"))
                 advance(p);

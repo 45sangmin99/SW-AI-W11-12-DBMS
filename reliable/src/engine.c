@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE 1
 #include "bpt.h"
 #include "binary.h"
+#include "group.h"
 #include "slots.h"
 #include "mdb.h"
 #include <ctype.h>
@@ -107,7 +108,7 @@ struct mdb_db {
     snapshot *current;
     uint64_t txnext, txreserved;
     uint64_t *committed;
-    size_t ncommitted, capcommitted, nsessions, max_sessions, max_changes, max_sort_rows;
+    size_t ncommitted, capcommitted, nsessions, max_sessions, max_changes, max_sort_rows, max_groups;
     int recovering;
     mdb_metrics metrics;
 #ifdef MDB_TESTING
@@ -1674,7 +1675,8 @@ mdb_db *mdb_open(const char *directory, mdb_error *e) {
     db->txnext = 1;
     if (configured_limit("MDB_MAX_SESSIONS", 256, &db->max_sessions, e) ||
         configured_limit("MDB_TX_MAX_CHANGES", 2000000, &db->max_changes, e) ||
-        configured_limit("MDB_MAX_SORT_ROWS", 1000000, &db->max_sort_rows, e))
+        configured_limit("MDB_MAX_SORT_ROWS", 1000000, &db->max_sort_rows, e) ||
+        configured_limit("MDB_MAX_GROUPS", 1000000, &db->max_groups, e))
         goto bad;
     if (pthread_mutex_init(&db->mutex, NULL)) {
         fail(e, MDB_IO, "Mutex initialization failed");
@@ -2059,6 +2061,115 @@ static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stm
     }
     return 0;
 }
+/* WHERE consumes the same snapshot/overlay stream for grouped and plain SELECT.
+ * Group keys own only their typed values, never references into a mutable row. */
+typedef struct {
+    mdb_group *state;
+    int projection[MDB_COL_MAX]; /* -1 denotes COUNT(*), otherwise a group key. */
+    int order[MDB_COL_MAX], descending[MDB_COL_MAX];
+} group_plan;
+static int group_key(const int *positions, size_t count, int column) {
+    for (size_t i = 0; i < count; i++)
+        if (positions[i] == column)
+            return (int)i;
+    return -1;
+}
+static int group_prepare(mdb_db *db, const tabledef *t, const mdb_stmt *st,
+                          group_plan *plan, mdb_result *out) {
+    int positions[MDB_COL_MAX];
+    for (size_t i = 0; i < st->ngroup_by; i++) {
+        int col = find_column(t, st->group_by[i]);
+        if (col < 0)
+            return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown GROUP BY column");
+        if (group_key(positions, i, col) >= 0)
+            return fail(&out->error, MDB_COLUMN_COUNT, "Duplicate GROUP BY column");
+        positions[i] = col;
+    }
+    out->ncolumns = st->star ? t->ncols : st->ncolumns;
+    out->columns = calloc(out->ncolumns, sizeof *out->columns);
+    out->types = calloc(out->ncolumns, sizeof *out->types);
+    if (!out->columns || !out->types)
+        return fail(&out->error, MDB_NOMEM, "Allocation failed");
+    for (size_t i = 0; i < out->ncolumns; i++) {
+        if (!st->star && st->column_counts && st->column_counts[i]) {
+            plan->projection[i] = -1;
+            out->columns[i] = strdup("count");
+            out->types[i] = MDB_INT;
+        } else {
+            int col = st->star ? (int)i : find_column(t, st->columns[i]);
+            if (col < 0)
+                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown SELECT column");
+            int key = group_key(positions, st->ngroup_by, col);
+            if (key < 0)
+                return fail(&out->error, MDB_SYNTAX,
+                            "Every non-aggregate SELECT column must appear in GROUP BY");
+            plan->projection[i] = key;
+            out->columns[i] = strdup(t->cols[col].name);
+            out->types[i] = t->cols[col].type;
+        }
+        if (!out->columns[i])
+            return fail(&out->error, MDB_NOMEM, "Allocation failed");
+    }
+    for (size_t i = 0; i < st->norder; i++) {
+        plan->descending[i] = st->order[i].descending;
+        if (st->order[i].count)
+            plan->order[i] = -1;
+        else {
+            int col = find_column(t, st->order[i].column);
+            if (col < 0)
+                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown ORDER BY column");
+            int key = group_key(positions, st->ngroup_by, col);
+            if (key < 0)
+                return fail(&out->error, MDB_SYNTAX,
+                            "ORDER BY column must appear in GROUP BY or use COUNT(*)");
+            plan->order[i] = key;
+        }
+    }
+    plan->state = mdb_group_create(positions, st->ngroup_by, db->max_groups, &out->error);
+    return plan->state ? 0 : -1;
+}
+static int group_result(const group_plan *plan, const mdb_stmt *st, mdb_result *out) {
+    size_t count = mdb_group_size(plan->state);
+    if (st->limit >= 0 && (uint64_t)st->limit < count)
+        count = (size_t)st->limit;
+    if (count > MDB_RESULT_MAX)
+        return fail(&out->error, MDB_LIMIT, "Grouped result exceeds 10000 rows; use LIMIT");
+    if (!count)
+        return 0;
+    size_t *order = NULL;
+    if (mdb_group_order(plan->state, plan->order, plan->descending, st->norder,
+                        &order, &out->error))
+        return -1;
+    out->rows = calloc(count, sizeof *out->rows);
+    if (!out->rows) {
+        free(order);
+        return fail(&out->error, MDB_NOMEM, "Allocation failed");
+    }
+    out->nrows = count;
+    int rc = -1;
+    for (size_t i = 0; i < count; i++) {
+        out->rows[i].values = calloc(out->ncolumns, sizeof(mdb_value));
+        if (!out->rows[i].values) {
+            fail(&out->error, MDB_NOMEM, "Allocation failed");
+            goto done;
+        }
+        const mdb_value *keys = mdb_group_keys(plan->state, order[i]);
+        for (size_t j = 0; j < out->ncolumns; j++) {
+            int key = plan->projection[j];
+            if (key < 0)
+                out->rows[i].values[j] = (mdb_value){
+                    .type = MDB_INT, .i = mdb_group_count(plan->state, order[i])};
+            else if (mdb_value_copy(&out->rows[i].values[j], &keys[key])) {
+                fail(&out->error, MDB_NOMEM, "Allocation failed");
+                goto done;
+            }
+        }
+    }
+    rc = 0;
+done:
+    free(order);
+    return rc;
+}
 typedef struct {
     row **rows;
     size_t n, cap;
@@ -2067,12 +2178,18 @@ typedef struct {
     const mdb_stmt *stmt;
     mdb_error *error;
     size_t max_sort_rows;
+    mdb_group *group;
 } selection;
 /* Takes ownership of r. Return 1 when an unordered LIMIT has been satisfied. */
 static int select_visit(selection *s, row *r) {
     if (!expr_eval(s->table, s->stmt->where, r)) {
         row_drop(r, s->table->ncols);
         return 0;
+    }
+    if (s->group) {
+        int rc = mdb_group_add(s->group, r->v, s->error);
+        row_drop(r, s->table->ncols);
+        return rc;
     }
     if (s->count == UINT64_MAX) {
         row_drop(r, s->table->ncols);
@@ -2178,14 +2295,31 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     tabledef *t = &db->defs[ti];
     if (expr_valid(t, st->where, &out->error))
         return -1;
-    for (size_t i = 0; i < st->norder; i++)
-        if (find_column(t, st->order[i].column) < 0)
-            return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown ORDER BY column");
+    group_plan grouped = {0};
     int positions[MDB_COL_MAX] = {0};
-    if (result_columns(out, t, st, positions))
-        return -1;
-    selection found = {
-        .table = t, .stmt = st, .error = &out->error, .max_sort_rows = db->max_sort_rows};
+    if (st->ngroup_by) {
+        if (group_prepare(db, t, st, &grouped, out)) {
+            mdb_group_free(grouped.state);
+            return -1;
+        }
+    } else {
+        for (size_t i = 0; i < st->ncolumns; i++)
+            if (st->column_counts && st->column_counts[i] && !st->count)
+                return fail(&out->error, MDB_SYNTAX,
+                            "Mixed COUNT(*) projections require GROUP BY");
+        for (size_t i = 0; i < st->norder; i++) {
+            if (st->order[i].count) {
+                if (!st->count)
+                    return fail(&out->error, MDB_SYNTAX,
+                                "ORDER BY COUNT(*) requires grouping or COUNT(*) projection");
+            } else if (find_column(t, st->order[i].column) < 0)
+                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown ORDER BY column");
+        }
+        if (result_columns(out, t, st, positions))
+            return -1;
+    }
+    selection found = {.table = t, .stmt = st, .error = &out->error,
+                       .max_sort_rows = db->max_sort_rows, .group = grouped.state};
     overlay *o = &tx->tables[ti];
     view *v = tx->snap->tables[ti];
     int rc = -1;
@@ -2193,7 +2327,7 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     const char *force = getenv("MDB_FORCE_SCAN");
     int indexed = !(force && strcmp(force, "0")) && mdb_expr_id(st->where, &id);
     out->used_index = indexed;
-    if (st->limit == 0 && !st->count) {
+    if (st->limit == 0 && (!st->count || st->ngroup_by)) {
         rc = 0;
         goto done;
     }
@@ -2279,6 +2413,10 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
                         break;
                 }
     }
+    if (grouped.state) {
+        rc = group_result(&grouped, st, out);
+        goto done;
+    }
     if (st->count) {
         if (found.count > INT64_MAX) {
             fail(&out->error, MDB_LIMIT, "COUNT exceeds int64 range");
@@ -2332,6 +2470,7 @@ done:
     for (size_t i = 0; i < found.n; i++)
         row_drop(found.rows[i], t->ncols);
     free(found.rows);
+    mdb_group_free(grouped.state);
     return rc;
 }
 /* Prepare immutable row versions without copying the table or writing data files.

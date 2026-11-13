@@ -30,6 +30,7 @@ static void test_statements(void) {
         "InSeRt INTO Characters (name, attack) VALUES ('총웨; FROM ''x''', -9223372036854775808);");
     assert(s->kind == MDB_INSERT && !strcmp(s->table, "characters"));
     assert(s->ncolumns == 2 && s->nvalues == 2);
+    assert(!s->column_counts && !s->group_by && !s->ngroup_by);
     assert(!strcmp(s->values[0].s, "총웨; FROM 'x'"));
     assert(s->values[1].i == INT64_MIN);
     mdb_stmt_free(s);
@@ -44,6 +45,7 @@ static void test_statements(void) {
     mdb_stmt_free(s);
     s = parse_ok("SELECT COUNT(*) FROM t WHERE id != -1 LIMIT 0;");
     assert(s->count && !s->star && s->limit == 0 && s->where->cmp == MDB_NE);
+    assert(s->ncolumns == 1 && s->column_counts[0] && !strcmp(s->columns[0], "count"));
     mdb_stmt_free(s);
     s = parse_ok("UPDATE t SET name='a,b\nline', attack=120 WHERE id=1;");
     assert(s->kind == MDB_UPDATE && s->nupdates == 2 &&
@@ -64,6 +66,54 @@ static void test_statements(void) {
     s = parse_ok("ROLLBACK ; \n");
     assert(s->kind == MDB_ROLLBACK);
     mdb_stmt_free(s);
+}
+static void test_grouping(void) {
+    mdb_stmt *s = parse_ok("SELECT name, COUNT(*) FROM characters WHERE attack>=100 "
+                           "GROUP BY name ORDER BY COUNT(*) DESC,name ASC LIMIT 3");
+    assert(s->kind == MDB_SELECT && !s->count && !s->star && s->ncolumns == 2);
+    assert(!strcmp(s->columns[0], "name") && !s->column_counts[0]);
+    assert(!strcmp(s->columns[1], "count") && s->column_counts[1]);
+    assert(s->where && s->ngroup_by == 1 && !strcmp(s->group_by[0], "name"));
+    assert(s->norder == 2 && s->order[0].count && s->order[0].descending);
+    assert(!s->order[1].count && !s->order[1].descending && s->limit == 3);
+    mdb_stmt_free(s);
+
+    s = parse_ok("sElEcT CoUnT ( * ), NaMe, Attack FROM Characters "
+                 "gRoUp By Attack, NaMe OrDeR BY cOuNt(*) aSc");
+    assert(s->ncolumns == 3 && !s->count && s->column_counts[0]);
+    assert(!s->column_counts[1] && !s->column_counts[2]);
+    assert(!strcmp(s->columns[1], "name") && !strcmp(s->columns[2], "attack"));
+    assert(s->ngroup_by == 2 && !strcmp(s->group_by[0], "attack") &&
+           !strcmp(s->group_by[1], "name"));
+    assert(s->order[0].count && !s->order[0].descending);
+    mdb_stmt_free(s);
+
+    s = parse_ok("SELECT count, COUNT(*) FROM count GROUP BY count "
+                 "ORDER BY count,COUNT(*) DESC");
+    assert(!s->count && s->ncolumns == 2 && !s->column_counts[0] && s->column_counts[1]);
+    assert(!strcmp(s->table, "count") && !strcmp(s->group_by[0], "count"));
+    assert(!s->order[0].count && s->order[1].count);
+    mdb_stmt_free(s);
+
+    s = parse_ok("SELECT count FROM t ORDER BY count");
+    assert(!s->count && !s->column_counts[0] && !s->order[0].count);
+    mdb_stmt_free(s);
+    s = parse_ok("SELECT COUNT(*) FROM t GROUP BY name");
+    assert(s->count && s->ncolumns == 1 && s->ngroup_by == 1);
+    mdb_stmt_free(s);
+    s = parse_ok("SELECT COUNT(*),COUNT(*) FROM t");
+    assert(!s->count && s->ncolumns == 2 && s->column_counts[0] && s->column_counts[1]);
+    mdb_stmt_free(s);
+    s = parse_ok("SELECT name FROM t GROUP BY name,name");
+    assert(s->ngroup_by == 2 && !strcmp(s->group_by[0], s->group_by[1]));
+    mdb_stmt_free(s); /* Schema validation, including duplicates, belongs to execution. */
+
+    char too_many[512] = "SELECT name FROM t GROUP BY ";
+    size_t length = strlen(too_many);
+    for (size_t i = 0; i <= MDB_COL_MAX; i++)
+        length += (size_t)snprintf(too_many + length, sizeof too_many - length,
+                                   "%sname", i ? "," : "");
+    parse_bad(too_many, MDB_LIMIT);
 }
 static void test_precedence_and_candidates(void) {
     mdb_stmt *s = parse_ok("SELECT * FROM t WHERE id=3 OR attack=2 AND name='x'");
@@ -105,6 +155,26 @@ static void test_errors(void) {
                              "INSERT INTO t (id,) VALUES (1)",
                              "UPDATE t SET id = x",
                              "SELECT count(id) FROM t",
+                             "SELECT COUNT() FROM t",
+                             "SELECT COUNT(**) FROM t",
+                             "SELECT COUNT(*) AS n FROM t",
+                             "SELECT COUNT(*) n FROM t",
+                             "SELECT SUM(*) FROM t",
+                             "SELECT AVG(attack) FROM t",
+                             "SELECT name, FROM t",
+                             "SELECT *,COUNT(*) FROM t",
+                             "SELECT name FROM t GROUP name",
+                             "SELECT name FROM t GROUP BY",
+                             "SELECT name FROM t GROUP BY ()",
+                             "SELECT name FROM t GROUP BY name,",
+                             "SELECT name FROM t GROUP BY COUNT(*)",
+                             "SELECT name FROM t GROUP BY name HAVING COUNT(*)>1",
+                             "SELECT name FROM t GROUP BY name WHERE id=1",
+                             "SELECT name FROM t GROUP BY name GROUP BY name",
+                             "SELECT name FROM t ORDER BY name GROUP BY name",
+                             "SELECT name FROM t LIMIT 1 GROUP BY name",
+                             "SELECT name FROM t GROUP BY name ORDER BY COUNT(name)",
+                             "SELECT name FROM t GROUP BY name ORDER BY SUM(*)",
                              "SELECT * FROM t LIMIT -1",
                              "BEGIN;;",
                              "SELECT * FROM t WHERE id=1 AND",
@@ -167,6 +237,7 @@ static void test_fuzz(void) {
 }
 int main(void) {
     test_statements();
+    test_grouping();
     test_precedence_and_candidates();
     test_errors();
     test_fuzz();

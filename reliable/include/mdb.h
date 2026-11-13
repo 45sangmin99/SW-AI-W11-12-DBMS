@@ -61,6 +61,7 @@ typedef enum {
 typedef struct {
     char *column;
     int descending;
+    int count; /* ORDER BY COUNT(*), distinct from a column named count. */
 } mdb_order;
 typedef struct {
     char *column;
@@ -71,10 +72,13 @@ typedef struct {
     char *table;
     char **columns;
     size_t ncolumns;
+    unsigned char *column_counts; /* SELECT item flags; COUNT(*) has name "count". */
     mdb_value *values;
     size_t nvalues;
     int star, count;
     mdb_expr *where;
+    char **group_by;
+    size_t ngroup_by;
     mdb_order *order;
     size_t norder;
     int64_t limit;
