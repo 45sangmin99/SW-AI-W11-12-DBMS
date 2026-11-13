@@ -120,12 +120,13 @@ int mdb_healthy(mdb_db *db);
 /* Returns durable committed tx status after recovery; engine-owned implementation. */
 int mdb_transaction_status(mdb_db *db, uint64_t txid);
 typedef struct {
-    double csv_write_s, index_build_s, wal_sync_s, recovery_s;
-    uint64_t csv_bytes;
+    double storage_write_s, index_build_s, wal_sync_s, recovery_s;
+    uint64_t storage_bytes;
 } mdb_metrics;
 void mdb_get_metrics(mdb_db *db, mdb_metrics *out);
 #ifdef MDB_TESTING
 void mdb_test_read_hook(mdb_db *db, void (*hook)(void *), void *context);
+void mdb_test_scan_hook(mdb_db *db, void (*hook)(void *), void *context);
 #endif
 const char *mdb_code_name(mdb_code code);
 int mdb_utf8(const char *text, size_t length);

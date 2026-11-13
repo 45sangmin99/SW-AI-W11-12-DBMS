@@ -260,7 +260,7 @@ def main():
     parser.add_argument("--prepare-timeout", type=float, default=900)
     parser.add_argument("--data-dir", type=pathlib.Path,
                         help="reuse a prepared records benchmark DB; mixed workload UPDATEs names")
-    parser.add_argument("--output", type=pathlib.Path, default=ROOT / "bench-server-results.json")
+    parser.add_argument("--output", type=pathlib.Path, default=ROOT / "binary-bench-server-results.json")
     args = parser.parse_args()
     workloads = args.workloads.split(",")
     if (args.count < 3 or args.count > 10_000_000 or args.requests < 1 or
@@ -274,7 +274,8 @@ def main():
         "platform": platform.platform(), "python": platform.python_version(),
         "measurement": "wall-clock real loopback HTTP; includes connection, JSON encode/decode and body read; excludes terminal output",
         "cache": "warm engine and OS cache after startup plus explicit warmups; no cold-cache claim",
-        "durability": "normal WAL/CSV fsync policy; no relaxed durability mode",
+        "storage_format": "fixed-width little-endian binary slots; CSV baseline retained for import/recovery",
+        "durability": "normal WAL/binary fsync policy; no relaxed durability mode",
         "isolation": "global optimistic commit version; mixed writes may conflict even for different rows",
         "mixed_write_fraction": f"1/{args.write_every}; UPDATE keeps id and k stable",
         "percentile": "nearest-rank p99 across successful and failed measured requests; report sample size",

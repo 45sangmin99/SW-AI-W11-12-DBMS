@@ -26,9 +26,9 @@ with tempfile.TemporaryDirectory(prefix='mdb-integration-') as folder:
     _,out=run(p,"SELECT COUNT(*) FROM characters WHERE attack>=100 AND (name='총웨' OR name='슈');");assert rows(out)==[['2']]
     _,out=run(p,'SELECT COUNT(*) FROM characters LIMIT 0;');assert rows(out)==[]
     proc,_=run(p,'SELECT * FROM ../outside;',check=False);assert proc.returncode
-    # A valid commit must survive loss/corruption of derived current CSV.
+    # A valid commit must survive loss/corruption of derived current binary file.
     for table in ('characters','items'):
-        (p/(table+'.csv')).write_bytes(b'corrupt derived output\n')
+        (p/(table+'.bin')).write_bytes(b'corrupt derived output\n')
     _,out=run(p,'SELECT COUNT(*) FROM characters;');assert rows(out)==[['4']],out
     _,out=run(p,'SELECT COUNT(*) FROM items;');assert rows(out)==[['1']],out
-print('PASS integration: SQL, overlay, rollback ID reservation, restart, UTF-8 multiline CSV, index oracle, failure boundaries, derived-file recovery')
+print('PASS integration: SQL, overlay, rollback ID reservation, restart, UTF-8 CSV import/binary storage, index oracle, failure boundaries, derived-file recovery')

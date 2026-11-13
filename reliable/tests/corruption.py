@@ -8,6 +8,16 @@ def rejected(p):
     result,_=run(p,'SELECT * FROM characters;',check=False)
     assert result.returncode!=0,(result.stdout,result.stderr)
     return result.stderr
+# First-time initialization must not overwrite an unknown binary file. Without
+# the baseline/WAL metadata there is no authority for treating it as derived.
+with tempfile.TemporaryDirectory(prefix='mdb-unowned-binary-') as folder:
+    p=pathlib.Path(folder);fixture(p)
+    original=b'pre-existing binary data must not be overwritten\x00\xff'
+    (p/'characters.bin').write_bytes(original)
+    rejected(p)
+    assert (p/'characters.bin').read_bytes()==original
+    assert not (p/'.mdb-base').exists()
+    assert not (p/'.mdb.init').exists()
 for kind in ('wal_checksum','wal_missing','baseline_missing','schema_change','marker_missing'):
     with tempfile.TemporaryDirectory(prefix='mdb-corruption-') as folder:
         p=pathlib.Path(folder);seed(p)
@@ -20,7 +30,7 @@ for kind in ('wal_checksum','wal_missing','baseline_missing','schema_change','ma
         elif kind=='schema_change':(p/'characters.schema').write_text('id INT AUTO\nname VARCHAR(79)\nattack INT\n')
         elif kind=='marker_missing':(p/'.mdb.init').unlink()
         rejected(p)
-        assert not (p/'characters.csv').read_bytes()==b'',kind
+        assert (p/'characters.bin').stat().st_size > 32,kind
 with tempfile.TemporaryDirectory(prefix='mdb-tail-') as folder:
     p=pathlib.Path(folder);seed(p)
     with (p/'.mdb.wal').open('ab') as f:f.write(b'\x01\x02\x03')

@@ -1,5 +1,7 @@
 #define _DARWIN_C_SOURCE 1
 #include "bpt.h"
+#include "binary.h"
+#include "slots.h"
 #include "mdb.h"
 #include <ctype.h>
 #include <dirent.h>
@@ -17,10 +19,13 @@
 #include <time.h>
 #include <unistd.h>
 
-/* All mutable shared state and reference counts are protected by db->mutex.
- * Published views are immutable: their fd and B+ tree always describe one inode.
- * A transaction owns only a snapshot reference and an ID hash of changed rows. */
+/* Snapshot references and row-store COW mutations are protected by db->mutex.
+ * Rows in published snapshots are immutable. Binary slots and the shared B+ tree
+ * are protected by tablefile.lock; readers never take db->mutex while holding it.
+ * Historical views read retained row versions when the backing file has advanced. */
 #define RECORD_MAX (1024U * 1024U)
+#define BINARY_RECORD_MAX (MDB_BIN_SLOT_HEADER + MDB_COL_MAX * (4U + MDB_TEXT_MAX))
+#define BINARY_READ_BUFFER 65536U
 #define CSV_RECORD_MAX (MDB_COL_MAX * (MDB_TEXT_MAX * 2U + 40U))
 #define RESERVE_BLOCK 4096U
 #define WAL_HEADER "MDBWAL1\n"
@@ -58,12 +63,18 @@ typedef struct {
     size_t ncols;
     uint64_t schemahash, basehash, next_id, reserved;
 } tabledef;
-typedef struct view {
-    size_t refs;
-    int fd;
-    row **rows;
-    size_t n;
+typedef struct {
+    size_t refs, record_size;
+    int fd, lock_ready;
+    uint64_t version;
     mdb_bpt *index;
+    pthread_rwlock_t lock;
+} tablefile;
+typedef struct view {
+    size_t refs, n;
+    uint64_t version;
+    tablefile *file;
+    mdb_slots *rows;
 } view;
 typedef struct snapshot {
     size_t refs;
@@ -74,6 +85,7 @@ typedef struct {
     int64_t id;
     row *value;
     int deleted, inserted;
+    size_t slot; /* Assigned during commit preparation, never derived from ID. */
 } change;
 typedef struct {
     change *v;
@@ -101,6 +113,8 @@ struct mdb_db {
 #ifdef MDB_TESTING
     void (*read_hook)(void *);
     void *read_hook_context;
+    void (*scan_hook)(void *);
+    void *scan_hook_context;
 #endif
 };
 struct mdb_session {
@@ -262,20 +276,51 @@ static int overlay_set(overlay *o, int64_t id, row *value, int deleted, int inse
     if (grow((void **)&o->v, &o->cap, o->n + 1, sizeof *o->v) || map_reserve(&o->map, o->n + 1))
         return -1;
     i = o->n++;
-    o->v[i] = (change){id, value, deleted, inserted};
+    o->v[i] = (change){.id = id, .value = value, .deleted = deleted, .inserted = inserted};
     map_put(&o->map, id, i);
     return 0;
 }
+static void slot_retain(void *value, void *context) {
+    (void)context;
+    ((row *)value)->refs++;
+}
+static void slot_release(void *value, void *context) {
+    row_drop(value, ((tabledef *)context)->ncols);
+}
+static void file_drop(tablefile *f) {
+    if (!f || --f->refs)
+        return;
+    if (f->fd >= 0)
+        close(f->fd);
+    if (f->lock_ready)
+        pthread_rwlock_destroy(&f->lock);
+    mdb_bpt_free(f->index);
+    free(f);
+}
 static void view_drop(mdb_db *db, view *v, size_t table) {
+    (void)db;
+    (void)table;
     if (!v || --v->refs)
         return;
-    if (v->fd >= 0)
-        close(v->fd);
-    mdb_bpt_free(v->index);
-    for (size_t i = 0; i < v->n; i++)
-        row_drop(v->rows[i], db->defs[table].ncols);
-    free(v->rows);
+    mdb_slots_free(v->rows);
+    file_drop(v->file);
     free(v);
+}
+static row *view_row(const view *v, size_t slot) {
+    return slot < v->n ? mdb_slots_get(v->rows, slot) : NULL;
+}
+static int view_search(const view *v, int64_t id, uint64_t *offset) {
+    pthread_rwlock_rdlock(&v->file->lock);
+    int found = mdb_bpt_search(v->file->index, id, offset);
+    pthread_rwlock_unlock(&v->file->lock);
+    if (!found || *offset < MDB_BIN_HEADER_SIZE ||
+        (*offset - MDB_BIN_HEADER_SIZE) % v->file->record_size)
+        return 0;
+    uint64_t slot = (*offset - MDB_BIN_HEADER_SIZE) / v->file->record_size;
+    if (slot >= v->n)
+        return 0;
+    row *r = view_row(v, (size_t)slot);
+    return r && r->v[0].i == id;
 }
 static void snapshot_drop(mdb_db *db, snapshot *s) {
     if (!s || --s->refs)
@@ -340,6 +385,22 @@ static int full_pread(int fd, void *data, size_t n, uint64_t offset) {
         return -1;
     while (n) {
         ssize_t k = pread(fd, p, n, (off_t)offset);
+        if (k < 0 && errno == EINTR)
+            continue;
+        if (k <= 0)
+            return -1;
+        p += (size_t)k;
+        n -= (size_t)k;
+        offset += (size_t)k;
+    }
+    return 0;
+}
+static int full_pwrite(int fd, const void *data, size_t n, uint64_t offset) {
+    const unsigned char *p = data;
+    if (offset > (uint64_t)INT64_MAX || n > (uint64_t)INT64_MAX - offset)
+        return -1;
+    while (n) {
+        ssize_t k = pwrite(fd, p, n, (off_t)offset);
         if (k < 0 && errno == EINTR)
             continue;
         if (k <= 0)
@@ -591,66 +652,92 @@ bad:
     row_drop(r, t->ncols);
     return NULL;
 }
-static int csv_encode(const tabledef *t, const row *r, char *out, size_t cap, size_t *length) {
-    size_t n = 0;
-    for (size_t i = 0; i < t->ncols; i++) {
-        if (i) {
-            if (n >= cap)
-                return -1;
-            out[n++] = ',';
+static size_t binary_columns(const tabledef *t, mdb_binary_column *columns) {
+    for (size_t i = 0; i < t->ncols; i++)
+        columns[i] = (mdb_binary_column){t->cols[i].type, t->cols[i].max};
+    return mdb_binary_record_size(columns, t->ncols);
+}
+typedef struct {
+    uint64_t offset;
+    size_t length;
+    unsigned char bytes[BINARY_READ_BUFFER];
+#ifdef MDB_TESTING
+    void (*hook)(void *);
+    void *hook_context;
+#endif
+} binary_reader;
+/* The cache contains only bytes from this view's generation. If a writer has
+ * advanced the shared file, retained immutable rows supply the old snapshot. */
+static row *view_read_cached(const tabledef *t, const view *v, uint64_t offset,
+                             binary_reader *cache, mdb_error *e) {
+    size_t size = v->file->record_size;
+    if (offset < MDB_BIN_HEADER_SIZE || (offset - MDB_BIN_HEADER_SIZE) % size)
+        return fail(e, MDB_CORRUPT, "Unaligned binary record offset"), NULL;
+    uint64_t slot = (offset - MDB_BIN_HEADER_SIZE) / size;
+    if (slot >= v->n)
+        return fail(e, MDB_CORRUPT, "Index offset outside binary snapshot"), NULL;
+    row *expected = view_row(v, (size_t)slot);
+    if (!expected)
+        return fail(e, MDB_CORRUPT, "Index points at a deleted snapshot slot"), NULL;
+    unsigned char local[BINARY_RECORD_MAX];
+    const unsigned char *bytes = NULL;
+    if (cache && offset >= cache->offset && offset - cache->offset < cache->length)
+        bytes = cache->bytes + (size_t)(offset - cache->offset);
+    else {
+        pthread_rwlock_rdlock(&v->file->lock);
+        if (v->version != v->file->version) {
+            pthread_rwlock_unlock(&v->file->lock);
+            row *copy = row_clone(expected, t->ncols);
+            if (!copy)
+                fail(e, MDB_NOMEM, "Allocation failed");
+            return copy;
         }
-        if (t->cols[i].type == MDB_INT) {
-            char b[32];
-            int k = snprintf(b, sizeof b, "%lld", (long long)r->v[i].i);
-            if (k < 0 || (size_t)k >= sizeof b || n > cap - (size_t)k)
-                return -1;
-            memcpy(out + n, b, (size_t)k);
-            n += (size_t)k;
+        int rc;
+        if (cache) {
+            size_t records = sizeof cache->bytes / size;
+            if (records > v->n - (size_t)slot)
+                records = v->n - (size_t)slot;
+            cache->offset = offset;
+            cache->length = records * size;
+            rc = full_pread(v->file->fd, cache->bytes, cache->length, offset);
+            bytes = cache->bytes;
         } else {
-            const char *s = r->v[i].s;
-            int quote = strpbrk(s, ",\"\r\n") != NULL;
-            if (quote) {
-                if (n >= cap)
-                    return -1;
-                out[n++] = '"';
-            }
-            for (; *s; s++) {
-                if (n >= cap)
-                    return -1;
-                out[n++] = *s;
-                if (*s == '"') {
-                    if (n >= cap)
-                        return -1;
-                    out[n++] = '"';
-                }
-            }
-            if (quote) {
-                if (n >= cap)
-                    return -1;
-                out[n++] = '"';
-            }
+            rc = full_pread(v->file->fd, local, size, offset);
+            bytes = local;
         }
+        pthread_rwlock_unlock(&v->file->lock);
+        if (rc)
+            return fail(e, MDB_IO, "Binary record read failed"), NULL;
+#ifdef MDB_TESTING
+        if (cache && cache->hook)
+            cache->hook(cache->hook_context);
+#endif
     }
-    if (n >= cap)
-        return -1;
-    out[n++] = '\n';
-    *length = n;
-    return 0;
+    mdb_binary_column columns[MDB_COL_MAX];
+    (void)binary_columns(t, columns);
+    mdb_value *values = NULL;
+    int deleted;
+    if (mdb_binary_decode(columns, t->ncols, bytes, size, &values, &deleted, e))
+        return NULL;
+    if (deleted)
+        return fail(e, MDB_CORRUPT, "Unexpected binary tombstone"), NULL;
+    row *r = row_new(t->ncols);
+    if (r) {
+        memcpy(r->v, values, t->ncols * sizeof *values);
+        free(values);
+        if (r->v[0].i != expected->v[0].i) {
+            row_drop(r, t->ncols);
+            return fail(e, MDB_CORRUPT, "Index/binary key mismatch"), NULL;
+        }
+        return r;
+    }
+    for (size_t i = 0; i < t->ncols; i++)
+        mdb_value_clear(&values[i]);
+    free(values);
+    return fail(e, MDB_NOMEM, "Allocation failed"), NULL;
 }
 static row *view_read(const tabledef *t, const view *v, uint64_t offset, mdb_error *e) {
-    csv_reader r = {.fd = v->fd, .offset = offset};
-    char *text = NULL;
-    size_t n;
-    uint64_t start;
-    int k = csv_record(&r, &text, &n, &start, e);
-    if (k != 1) {
-        if (!k)
-            fail(e, MDB_CORRUPT, "Index offset outside CSV");
-        return NULL;
-    }
-    row *value = csv_parse(t, text, n, e);
-    free(text);
-    return value;
+    return view_read_cached(t, v, offset, NULL, e);
 }
 static int rowset_add(rowset *s, row *r, mdb_error *e) {
     size_t old;
@@ -874,6 +961,13 @@ static int initialize(mdb_db *db, mdb_error *e) {
         exists_at(db->dirfd, ".mdb.wal"))
         return fail(e, MDB_CORRUPT,
                     "Initialization incomplete: required initialization marker missing");
+    for (size_t i = 0; i < db->ntables; i++) {
+        char name[MDB_NAME_MAX + 16];
+        (void)snprintf(name, sizeof name, "%s.bin", db->defs[i].name);
+        if (exists_at(db->dirfd, name))
+            return fail(e, MDB_CORRUPT,
+                        "Binary table without recovery metadata; refusing initialization");
+    }
     if (mkdirat(db->dirfd, ".mdb-base.tmp", 0700))
         return fail(e, MDB_IO, "Cannot prepare baseline");
     int base = openat(db->dirfd, ".mdb-base.tmp", O_RDONLY | O_DIRECTORY);
@@ -1368,89 +1462,105 @@ done:
     return rc;
 }
 static void tempfile_name(char *out, size_t cap, const tabledef *t) {
-    (void)snprintf(out, cap, ".mdb-new-%s.csv", t->name);
+    (void)snprintf(out, cap, ".mdb-new-%s.bin", t->name);
 }
-static view *build_view(mdb_db *db, size_t ti, row **rows, size_t count, mdb_error *e) {
+/* Full materialization is reserved for startup recovery, not normal commits. */
+static view *build_view(mdb_db *db, size_t ti, row **rows, size_t count,
+                        uint64_t version, mdb_error *e) {
     tabledef *t = &db->defs[ti];
     view *v = calloc(1, sizeof *v);
-    if (!v) {
+    tablefile *f = calloc(1, sizeof *f);
+    if (!v || !f) {
+        free(v);
+        free(f);
         fail(e, MDB_NOMEM, "Allocation failed");
         return NULL;
     }
-    v->refs = 1;
-    v->fd = -1;
+    v->refs = f->refs = 1;
+    v->file = f;
+    v->version = f->version = version;
+    f->fd = -1;
     char filename[MDB_NAME_MAX + 32];
     tempfile_name(filename, sizeof filename, t);
-    v->fd = openat(db->dirfd, filename, O_CREAT | O_TRUNC | O_RDWR, 0600);
-    if (v->fd < 0) {
-        fail(e, MDB_IO, "Cannot create replacement CSV");
+    if (pthread_rwlock_init(&f->lock, NULL)) {
+        fail(e, MDB_IO, "Table lock initialization failed");
         goto bad;
     }
-    if (count > SIZE_MAX / sizeof(row *) || count > SIZE_MAX / sizeof(uint64_t)) {
-        fail(e, MDB_LIMIT, "Table exceeds memory limits");
+    f->lock_ready = 1;
+    mdb_binary_column columns[MDB_COL_MAX];
+    f->record_size = binary_columns(t, columns);
+    if (!f->record_size || count > ((uint64_t)INT64_MAX - MDB_BIN_HEADER_SIZE) / f->record_size ||
+        count > SIZE_MAX / sizeof(uint64_t)) {
+        fail(e, MDB_LIMIT, "Binary table size overflow");
         goto bad;
     }
-    v->rows = malloc((count ? count : 1) * sizeof *v->rows);
+    v->rows = mdb_slots_create(slot_retain, slot_release, t);
+    if (!v->rows) {
+        fail(e, MDB_NOMEM, "Allocation failed");
+        goto bad;
+    }
+    f->fd = openat(db->dirfd, filename, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (f->fd < 0) {
+        fail(e, MDB_IO, "Cannot create recovery binary table");
+        goto bad;
+    }
     int64_t *keys = malloc((count ? count : 1) * sizeof *keys);
     uint64_t *offsets = malloc((count ? count : 1) * sizeof *offsets);
-    if (!v->rows || !keys || !offsets) {
+    if (!keys || !offsets) {
         free(keys);
         free(offsets);
         fail(e, MDB_NOMEM, "Allocation failed");
         goto bad;
     }
-    uint64_t offset = 0;
-    double csv_started = seconds();
-    char buffer[CSV_RECORD_MAX];
-    for (size_t j = 0; j < count; j++) {
-        size_t len;
-        if (csv_encode(t, rows[j], buffer, sizeof buffer, &len)) {
-            free(keys);
-            free(offsets);
-            fail(e, MDB_IO, "CSV encoding failed");
-            goto bad;
-        }
-        const char *io = getenv("MDB_IO_FAIL");
-        if (!db->recovering && io && strcmp(io, "csv_write") == 0) {
-            (void)full_write(v->fd, buffer, len / 2);
-            free(keys);
-            free(offsets);
-            fail(e, MDB_IO, "Injected replacement CSV write failure");
-            goto bad;
-        }
-        if (offset > (uint64_t)INT64_MAX - len || full_write(v->fd, buffer, len)) {
-            free(keys);
-            free(offsets);
-            fail(e, MDB_IO, "Replacement CSV write failed");
-            goto bad;
-        }
-        keys[j] = rows[j]->v[0].i;
-        offsets[j] = offset;
-        offset += len;
-        v->rows[v->n++] = rows[j];
-        rows[j]->refs++;
+    unsigned char header[MDB_BIN_HEADER_SIZE];
+    if (mdb_binary_header_encode(header, t->schemahash, t->ncols, f->record_size) ||
+        full_write(f->fd, header, sizeof header)) {
+        free(keys);
+        free(offsets);
+        fail(e, MDB_IO, "Binary header write failed");
+        goto bad;
     }
-    double index_started = seconds();
-    db->metrics.csv_write_s += index_started - csv_started;
-    db->metrics.csv_bytes += offset;
-    v->index = mdb_bpt_bulk(keys, offsets, count);
+    double started = seconds();
+    unsigned char buffer[BINARY_READ_BUFFER];
+    size_t buffered = 0;
+    int failed = 0;
+    for (size_t j = 0; j < count; j++) {
+        if (sizeof buffer - buffered < f->record_size) {
+            if (full_write(f->fd, buffer, buffered)) {
+                failed = 1;
+                break;
+            }
+            buffered = 0;
+        }
+        if (mdb_binary_encode(columns, t->ncols, rows[j]->v, 0, buffer + buffered,
+                              f->record_size, e) || mdb_slots_set(v->rows, j, rows[j])) {
+            failed = 1;
+            break;
+        }
+        buffered += f->record_size;
+        keys[j] = rows[j]->v[0].i;
+        offsets[j] = MDB_BIN_HEADER_SIZE + (uint64_t)j * f->record_size;
+        v->n++;
+    }
+    if (!failed && (full_write(f->fd, buffer, buffered) || syncfd(f->fd)))
+        failed = 1;
+    db->metrics.storage_write_s += seconds() - started;
+    if (failed) {
+        free(keys);
+        free(offsets);
+        fail(e, MDB_IO, "Binary recovery materialization failed");
+        goto bad;
+    }
+    db->metrics.storage_bytes += MDB_BIN_HEADER_SIZE + (uint64_t)count * f->record_size;
+    started = seconds();
+    f->index = mdb_bpt_bulk(keys, offsets, count);
     free(keys);
     free(offsets);
-    if (!v->index) {
-        fail(e, MDB_NOMEM, "Cannot build replacement index");
+    db->metrics.index_build_s += seconds() - started;
+    if (!f->index || mdb_bpt_validate(f->index)) {
+        fail(e, MDB_NOMEM, "Cannot build recovery index");
         goto bad;
     }
-    if (mdb_bpt_validate(v->index)) {
-        fail(e, MDB_CORRUPT, "Replacement index validation failed");
-        goto bad;
-    }
-    double sync_started = seconds();
-    db->metrics.index_build_s += sync_started - index_started;
-    if (syncfd(v->fd)) {
-        fail(e, MDB_IO, "Replacement CSV synchronization failed");
-        goto bad;
-    }
-    db->metrics.csv_write_s += seconds() - sync_started;
     return v;
 bad:
     view_drop(db, v, ti);
@@ -1460,7 +1570,7 @@ bad:
 static int install_view(mdb_db *db, size_t ti) {
     char temp[MDB_NAME_MAX + 32], target[MDB_NAME_MAX + 16];
     tempfile_name(temp, sizeof temp, &db->defs[ti]);
-    (void)snprintf(target, sizeof target, "%s.csv", db->defs[ti].name);
+    (void)snprintf(target, sizeof target, "%s.bin", db->defs[ti].name);
     return renameat(db->dirfd, temp, db->dirfd, target);
 }
 static int recover(mdb_db *db, mdb_error *e) {
@@ -1506,7 +1616,7 @@ static int recover(mdb_db *db, mdb_error *e) {
             if (sets[i].v[j])
                 sets[i].v[n++] = sets[i].v[j];
         sets[i].n = n;
-        s->tables[i] = build_view(db, i, sets[i].v, n, e);
+        s->tables[i] = build_view(db, i, sets[i].v, n, s->version, e);
         if (!s->tables[i])
             goto done;
         if (i == 0)
@@ -1514,7 +1624,7 @@ static int recover(mdb_db *db, mdb_error *e) {
     }
     for (size_t i = 0; i < db->ntables; i++)
         if (install_view(db, i)) {
-            fail(e, MDB_IO, "Recovery CSV replacement failed");
+            fail(e, MDB_IO, "Recovery binary replacement failed");
             goto done;
         }
     if (syncfd(db->dirfd)) {
@@ -1653,6 +1763,12 @@ void mdb_test_read_hook(mdb_db *db, void (*fn)(void *), void *context) {
     pthread_mutex_lock(&db->mutex);
     db->read_hook = fn;
     db->read_hook_context = context;
+    pthread_mutex_unlock(&db->mutex);
+}
+void mdb_test_scan_hook(mdb_db *db, void (*fn)(void *), void *context) {
+    pthread_mutex_lock(&db->mutex);
+    db->scan_hook = fn;
+    db->scan_hook_context = context;
     pthread_mutex_unlock(&db->mutex);
 }
 #endif
@@ -1841,6 +1957,35 @@ static int execute_insert(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     out->has_inserted_id = 1;
     return 0;
 }
+static int stage_change(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt *st,
+                         const int *positions, row *base, int inserted, mdb_result *out) {
+    tabledef *t = &db->defs[ti];
+    if (!expr_eval(t, st->where, base))
+        return 0;
+    int64_t id = base->v[0].i;
+    row *changed = NULL;
+    int deleted = st->kind == MDB_DELETE;
+    if (!deleted) {
+        changed = row_clone(base, t->ncols);
+        if (!changed)
+            return fail(&out->error, MDB_NOMEM, "Allocation failed");
+        for (size_t j = 0; j < st->nupdates; j++) {
+            int col = positions[j];
+            mdb_value_clear(&changed->v[col]);
+            if (mdb_value_copy(&changed->v[col], &st->updates[j].value)) {
+                row_drop(changed, t->ncols);
+                return fail(&out->error, MDB_NOMEM, "Allocation failed");
+            }
+        }
+    }
+    if (tx_set(db, tx, ti, id, changed, deleted, inserted, &out->error)) {
+        row_drop(changed, t->ncols);
+        return -1;
+    }
+    out->affected++;
+    tx->writes = 1;
+    return 0;
+}
 static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt *st,
                            mdb_result *out) {
     tabledef *t = &db->defs[ti];
@@ -1864,6 +2009,25 @@ static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stm
     }
     overlay *o = &tx->tables[ti];
     view *v = tx->snap->tables[ti];
+    int64_t candidate;
+    const char *force = getenv("MDB_FORCE_SCAN");
+    if (!(force && strcmp(force, "0")) && mdb_expr_id(st->where, &candidate)) {
+        out->used_index = 1;
+        size_t j;
+        row *base = NULL;
+        int inserted = 0;
+        if (map_get(&o->map, candidate, &j)) {
+            if (!o->v[j].deleted) {
+                base = o->v[j].value;
+                inserted = o->v[j].inserted;
+            }
+        } else {
+            uint64_t offset;
+            if (view_search(v, candidate, &offset))
+                base = view_row(v, (size_t)((offset - MDB_BIN_HEADER_SIZE) / v->file->record_size));
+        }
+        return base ? stage_change(db, tx, ti, st, positions, base, inserted, out) : 0;
+    }
     size_t original_changes =
         o->n; /* Existing rows retain their physical scan position; inserted rows follow. */
     for (size_t phase = 0; phase < 2; phase++) {
@@ -1876,10 +2040,11 @@ static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stm
                 if (!o->v[i].inserted || o->v[i].deleted)
                     continue;
                 base = o->v[i].value;
-                id = o->v[i].id;
                 inserted = 1;
             } else {
-                base = v->rows[i];
+                base = view_row(v, i);
+                if (!base)
+                    continue;
                 id = base->v[0].i;
                 size_t j;
                 if (map_get(&o->map, id, &j)) {
@@ -1888,29 +2053,8 @@ static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stm
                     base = o->v[j].value;
                 }
             }
-            if (!expr_eval(t, st->where, base))
-                continue;
-            row *changed = NULL;
-            int deleted = st->kind == MDB_DELETE;
-            if (!deleted) {
-                changed = row_clone(base, t->ncols);
-                if (!changed)
-                    return fail(&out->error, MDB_NOMEM, "Allocation failed");
-                for (size_t j = 0; j < st->nupdates; j++) {
-                    int col = positions[j];
-                    mdb_value_clear(&changed->v[col]);
-                    if (mdb_value_copy(&changed->v[col], &st->updates[j].value)) {
-                        row_drop(changed, t->ncols);
-                        return fail(&out->error, MDB_NOMEM, "Allocation failed");
-                    }
-                }
-            }
-            if (tx_set(db, tx, ti, id, changed, deleted, inserted, &out->error)) {
-                row_drop(changed, t->ncols);
+            if (stage_change(db, tx, ti, st, positions, base, inserted, out))
                 return -1;
-            }
-            out->affected++;
-            tx->writes = 1;
         }
     }
     return 0;
@@ -2055,7 +2199,7 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     }
     if (indexed) {
         uint64_t offset; /* Always execute the real tree search, including for own inserted rows. */
-        int exists = mdb_bpt_search(v->index, id, &offset);
+        int exists = view_search(v, id, &offset);
         row *r = NULL;
         if (exists) {
             r = view_read(t, v, offset, &out->error);
@@ -2063,7 +2207,7 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
                 goto done;
             if (r->v[0].i != id) {
                 row_drop(r, t->ncols);
-                fail(&out->error, MDB_CORRUPT, "Index/CSV key mismatch");
+                fail(&out->error, MDB_CORRUPT, "Index/binary key mismatch");
                 goto done;
             }
         }
@@ -2082,19 +2226,20 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
         if (r && select_visit(&found, r) < 0)
             goto done;
     } else {
-        csv_reader reader = {.fd = v->fd};
+        binary_reader reader = {0};
+#ifdef MDB_TESTING
+        pthread_mutex_lock(&db->mutex);
+        reader.hook = db->scan_hook;
+        reader.hook_context = db->scan_hook_context;
+        pthread_mutex_unlock(&db->mutex);
+#endif
         int stop = 0;
-        for (;;) {
-            char *text = NULL;
-            size_t len;
-            uint64_t offset;
-            int k = csv_record(&reader, &text, &len, &offset, &out->error);
-            if (k < 0)
-                goto done;
-            if (!k)
-                break;
-            row *r = csv_parse(t, text, len, &out->error);
-            free(text);
+        for (size_t slot = 0; slot < v->n; slot++) {
+            if (!view_row(v, slot))
+                continue;
+            uint64_t offset = MDB_BIN_HEADER_SIZE + (uint64_t)slot * v->file->record_size;
+            row *r = view_read_cached(t, v, offset, &reader, &out->error);
+            int k;
             if (!r)
                 goto done;
             size_t j;
@@ -2189,6 +2334,8 @@ done:
     free(found.rows);
     return rc;
 }
+/* Prepare immutable row versions without copying the table or writing data files.
+ * Only changed radix paths are copied; existing ID-to-slot mappings stay stable. */
 static snapshot *prepare_commit(mdb_db *db, transaction *tx, mdb_error *e) {
     snapshot *s = calloc(1, sizeof *s);
     if (!s) {
@@ -2211,42 +2358,114 @@ static snapshot *prepare_commit(mdb_db *db, transaction *tx, mdb_error *e) {
             old->refs++;
             continue;
         }
-        if (o->n > SIZE_MAX - old->n || (old->n + o->n) > SIZE_MAX / sizeof(row *)) {
-            fail(e, MDB_LIMIT, "Table size overflow");
-            goto bad;
-        }
-        row **rows = malloc((old->n + o->n + 1) * sizeof *rows);
-        if (!rows) {
+        view *v = calloc(1, sizeof *v);
+        if (!v) {
             fail(e, MDB_NOMEM, "Allocation failed");
             goto bad;
         }
-        size_t count = 0;
-        for (size_t j = 0; j < old->n; j++) {
-            size_t k;
-            if (map_get(&o->map, old->rows[j]->v[0].i, &k)) {
-                if (!o->v[k].deleted)
-                    rows[count++] = o->v[k].value;
-            } else
-                rows[count++] = old->rows[j];
-        }
-        for (size_t j = 0; j < o->n; j++)
-            if (o->v[j].inserted && !o->v[j].deleted)
-                rows[count++] = o->v[j].value;
-        s->tables[ti] = build_view(db, ti, rows, count, e);
-        free(rows);
-        if (!s->tables[ti])
+        s->tables[ti] = v;
+        v->refs = 1;
+        v->version = s->version;
+        v->n = old->n;
+        v->file = old->file;
+        v->file->refs++;
+        v->rows = mdb_slots_clone(old->rows);
+        if (!v->rows) {
+            fail(e, MDB_NOMEM, "Allocation failed");
             goto bad;
+        }
+        mdb_binary_column columns[MDB_COL_MAX];
+        size_t size = binary_columns(&db->defs[ti], columns);
+        unsigned char buffer[BINARY_RECORD_MAX];
+        for (size_t j = 0; j < o->n; j++) {
+            change *c = &o->v[j];
+            if (c->inserted && c->deleted)
+                continue;
+            if (c->inserted) {
+                if (v->n >= ((uint64_t)INT64_MAX - MDB_BIN_HEADER_SIZE) / size) {
+                    fail(e, MDB_LIMIT, "Binary table size overflow");
+                    goto bad;
+                }
+                c->slot = v->n++;
+            } else {
+                uint64_t offset;
+                if (!view_search(old, c->id, &offset)) {
+                    fail(e, MDB_CORRUPT, "Changed row is missing from snapshot index");
+                    goto bad;
+                }
+                c->slot = (size_t)((offset - MDB_BIN_HEADER_SIZE) / size);
+            }
+            const char *io = getenv("MDB_IO_FAIL");
+            if (io && strcmp(io, "binary_prepare") == 0) {
+                fail(e, MDB_IO, "Injected binary preparation failure");
+                goto bad;
+            }
+            mdb_value tombstone = {.type = MDB_INT, .i = c->id};
+            const mdb_value *values = c->deleted ? &tombstone : c->value->v;
+            if (mdb_binary_encode(columns, db->defs[ti].ncols, values, c->deleted,
+                                  buffer, size, e))
+                goto bad;
+            if (mdb_slots_set(v->rows, c->slot, c->deleted ? NULL : c->value)) {
+                fail(e, MDB_NOMEM, "Allocation failed");
+                goto bad;
+            }
+        }
     }
     return s;
 bad:
     snapshot_drop(db, s);
-    for (size_t i = 0; i < db->ntables; i++)
-        if (tx->tables[i].n) {
-            char temp[MDB_NAME_MAX + 32];
-            tempfile_name(temp, sizeof temp, &db->defs[i]);
-            (void)unlinkat(db->dirfd, temp, 0);
-        }
     return NULL;
+}
+/* WAL is already durable. Failure here MUST stop the engine for recovery. */
+static int apply_table(mdb_db *db, transaction *tx, snapshot *next, size_t ti) {
+    tabledef *t = &db->defs[ti];
+    overlay *o = &tx->tables[ti];
+    tablefile *f = next->tables[ti]->file;
+    mdb_binary_column columns[MDB_COL_MAX];
+    size_t size = binary_columns(t, columns);
+    unsigned char buffer[BINARY_RECORD_MAX];
+    double started = seconds(), index_elapsed = 0;
+    int rc = -1;
+    pthread_rwlock_wrlock(&f->lock);
+    /* Old readers must switch to retained versions even if a write fails halfway. */
+    f->version = next->version;
+    for (size_t j = 0; j < o->n; j++) {
+        change *c = &o->v[j];
+        if (c->inserted && c->deleted)
+            continue;
+        mdb_value tombstone = {.type = MDB_INT, .i = c->id};
+        const mdb_value *values = c->deleted ? &tombstone : c->value->v;
+        if (mdb_binary_encode(columns, t->ncols, values, c->deleted, buffer, size, NULL))
+            goto done;
+        uint64_t offset = MDB_BIN_HEADER_SIZE + (uint64_t)c->slot * size;
+        const char *fp = getenv("MDB_FAILPOINT"), *io = getenv("MDB_IO_FAIL");
+        if ((fp && !strcmp(fp, "binary_partial")) || (io && !strcmp(io, "binary_write"))) {
+            (void)full_pwrite(f->fd, buffer, size / 2, offset);
+            fault("binary_partial");
+            goto done;
+        }
+        if (full_pwrite(f->fd, buffer, size, offset))
+            goto done;
+        db->metrics.storage_bytes += size;
+        if (c->inserted) {
+            if (io && !strcmp(io, "index_insert"))
+                goto done;
+            double index_started = seconds();
+            int inserted = mdb_bpt_insert(f->index, c->id, offset);
+            double elapsed = seconds() - index_started;
+            db->metrics.index_build_s += elapsed;
+            index_elapsed += elapsed;
+            if (inserted)
+                goto done;
+        }
+    }
+    if (syncfd(f->fd))
+        goto done;
+    rc = 0;
+done:
+    pthread_rwlock_unlock(&f->lock);
+    db->metrics.storage_write_s += seconds() - started - index_elapsed;
+    return rc;
 }
 static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     pthread_mutex_lock(&db->mutex);
@@ -2313,9 +2532,9 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     fault("after_commit_sync");
     for (size_t ti = 0; ti < db->ntables; ti++)
         if (tx->tables[ti].n) {
-            if (install_view(db, ti))
+            if (apply_table(db, tx, next, ti))
                 goto durable_failure;
-            fault("after_csv_rename");
+            fault("after_binary_write");
         }
     if (syncfd(db->dirfd))
         goto durable_failure;
@@ -2341,17 +2560,10 @@ durable_failure:
     db->healthy = 0;
     out->recovery_required = 1;
     fail(&out->error, MDB_IO,
-         "Commit is durable; CSV/completion needs recovery before further SQL");
+         "Commit is durable; binary/completion needs recovery before further SQL");
 done:
     if (next)
         snapshot_drop(db, next);
-    if (rc)
-        for (size_t i = 0; i < db->ntables; i++)
-            if (tx->tables[i].n) {
-                char temp[MDB_NAME_MAX + 32];
-                tempfile_name(temp, sizeof temp, &db->defs[i]);
-                (void)unlinkat(db->dirfd, temp, 0);
-            }
     pthread_mutex_unlock(&db->mutex);
     return rc;
 }

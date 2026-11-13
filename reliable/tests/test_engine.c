@@ -117,10 +117,118 @@ static void parallel_reads(mdb_db *db) {
     pthread_cond_destroy(&g.ready);
     pthread_mutex_destroy(&g.mutex);
 }
+
+typedef struct {
+    mdb_db *db;
+    mdb_result result;
+} scan_job;
+
+static void *scan_once(void *context) {
+    scan_job *job = context;
+    mdb_error error;
+    mdb_session *session = mdb_session_open(job->db, &error);
+    assert(session);
+    job->result = execute(session, "SELECT id,name,attack FROM characters ORDER BY id");
+    mdb_session_close(session);
+    return NULL;
+}
+
+static void scan_snapshot_across_cache_boundary(void) {
+    enum { ROW_COUNT = 1000 };
+    char dir[] = "/tmp/mdb-scan-snapshot-XXXXXX";
+    assert(mkdtemp(dir));
+    file(dir, "characters.schema", "id INT AUTO\nname VARCHAR(80)\nattack INT\n");
+    file(dir, "characters.csv", "");
+    mdb_error error;
+    mdb_db *db = mdb_open(dir, &error);
+    assert(db);
+    mdb_session *writer = mdb_session_open(db, &error);
+    assert(writer);
+    ok(writer, "BEGIN");
+    for (int i = 1; i <= ROW_COUNT; i++)
+        assert(insert(writer, "before", i) == i);
+    ok(writer, "COMMIT");
+
+    gate g;
+    memset(&g, 0, sizeof g);
+    assert(!pthread_mutex_init(&g.mutex, NULL));
+    assert(!pthread_cond_init(&g.ready, NULL));
+    mdb_test_scan_hook(db, read_hook, &g);
+    scan_job job = {.db = db};
+    pthread_t reader;
+    assert(!pthread_create(&reader, NULL, scan_once, &job));
+    pthread_mutex_lock(&g.mutex);
+    struct timespec deadline;
+    assert(!clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += 5;
+    while (!g.entered)
+        assert(!pthread_cond_timedwait(&g.ready, &g.mutex, &deadline));
+    pthread_mutex_unlock(&g.mutex);
+
+    /* The reader has copied the first 564 fixed-width (116-byte) slots.
+     * Change one cached row and two rows beyond that cache, then append.
+     * Its next chunk must come from retained rows, not the newer file. */
+    ok(writer, "BEGIN");
+    ok(writer, "UPDATE characters SET name='inside',attack=-2 WHERE id=2");
+    ok(writer, "UPDATE characters SET name='outside',attack=-800 WHERE id=800");
+    ok(writer, "DELETE FROM characters WHERE id=900");
+    assert(insert(writer, "after", 7777) == ROW_COUNT + 1);
+    ok(writer, "COMMIT");
+
+    pthread_mutex_lock(&g.mutex);
+    g.release = 1;
+    pthread_cond_broadcast(&g.ready);
+    pthread_mutex_unlock(&g.mutex);
+    assert(!pthread_join(reader, NULL));
+    mdb_test_scan_hook(db, NULL, NULL);
+    assert(g.entered == 1);
+    assert(!job.result.used_index);
+    assert(job.result.nrows == ROW_COUNT && job.result.ncolumns == 3);
+    for (size_t i = 0; i < job.result.nrows; i++) {
+        mdb_value *values = job.result.rows[i].values;
+        assert(values[0].i == (int64_t)i + 1);
+        assert(!strcmp(values[1].s, "before"));
+        assert(values[2].i == (int64_t)i + 1);
+    }
+    mdb_result_free(&job.result);
+
+    mdb_result current = execute(writer, "SELECT id,name,attack FROM characters ORDER BY id");
+    assert(!current.used_index);
+    assert(current.nrows == ROW_COUNT && current.ncolumns == 3);
+    for (size_t i = 0; i < current.nrows; i++) {
+        int64_t id = (int64_t)i + 1;
+        if (id >= 900)
+            id++;
+        const char *name = "before";
+        int64_t attack = id;
+        if (id == 2) {
+            name = "inside";
+            attack = -2;
+        } else if (id == 800) {
+            name = "outside";
+            attack = -800;
+        } else if (id == ROW_COUNT + 1) {
+            name = "after";
+            attack = 7777;
+        }
+        mdb_value *values = current.rows[i].values;
+        assert(values[0].i == id);
+        assert(!strcmp(values[1].s, name));
+        assert(values[2].i == attack);
+    }
+    mdb_result_free(&current);
+    assert(!pthread_cond_destroy(&g.ready));
+    assert(!pthread_mutex_destroy(&g.mutex));
+    mdb_session_close(writer);
+    mdb_close(db);
+    char command[600];
+    snprintf(command, sizeof command, "rm -rf %s", dir);
+    assert(system(command) == 0);
+}
 #endif
 static void io_failures(void) {
-    const char *points[] = {"wal_write", "wal_fsync", "applied_write"};
-    for (size_t i = 0; i < 3; i++) {
+    const char *points[] = {"wal_write", "wal_fsync", "applied_write", "index_insert"};
+    for (size_t i = 0; i < sizeof points / sizeof *points; i++) {
         char dir[] = "/tmp/mdb-io-XXXXXX";
         assert(mkdtemp(dir));
         file(dir, "characters.schema", "id INT AUTO\nname VARCHAR(80)\nattack INT\n");
@@ -135,7 +243,7 @@ static void io_failures(void) {
         mdb_result r;
         assert(mdb_execute(session, "INSERT INTO characters VALUES ('uncertain',2)", &r) < 0);
         assert(r.error.code == MDB_IO && r.recovery_required);
-        assert(r.commit == (i == 2 ? MDB_DURABLE : MDB_UNKNOWN));
+        assert(r.commit == (i >= 2 ? MDB_DURABLE : MDB_UNKNOWN));
         uint64_t txid = r.txid;
         mdb_result_free(&r);
         assert(!mdb_healthy(db));
@@ -191,6 +299,46 @@ static void limits(void) {
     bad(a, "SELECT * FROM characters LIMIT 10001", MDB_LIMIT);
     mdb_session_close(a);
     mdb_session_close(b);
+    mdb_close(db);
+    char command[600];
+    snprintf(command, sizeof command, "rm -rf %s", dir);
+    assert(system(command) == 0);
+}
+static void partial_writes(void) {
+    char dir[] = "/tmp/mdb-partial-XXXXXX";
+    assert(mkdtemp(dir));
+    file(dir, "characters.schema", "id INT AUTO\nname VARCHAR(80)\nattack INT\n");
+    file(dir, "characters.csv", "");
+    mdb_error error;
+    mdb_db *db = mdb_open(dir, &error);
+    assert(db);
+    mdb_session *session = mdb_session_open(db, &error);
+    assert(session);
+    ok(session, "BEGIN");
+    for (int i = 0; i < 200; i++)
+        insert(session, "fixed", i);
+    ok(session, "COMMIT");
+    mdb_metrics before, after;
+    mdb_get_metrics(db, &before);
+    mdb_result result = execute(session, "UPDATE characters SET name='longer, \"value\"',attack=120 WHERE id=1");
+    assert(result.used_index && result.affected == 1);
+    mdb_result_free(&result);
+    mdb_get_metrics(db, &after);
+    assert(after.storage_bytes - before.storage_bytes == 116);
+    assert(after.index_build_s == before.index_build_s);
+    before = after;
+    result = execute(session, "DELETE FROM characters WHERE id=2");
+    assert(result.used_index && result.affected == 1);
+    mdb_result_free(&result);
+    mdb_get_metrics(db, &after);
+    assert(after.storage_bytes - before.storage_bytes == 116);
+    assert(after.index_build_s == before.index_build_s);
+    assert(scalar(session, "SELECT COUNT(*) FROM characters") == 199);
+    before = after;
+    insert(session, "appended", 999);
+    mdb_get_metrics(db, &after);
+    assert(after.storage_bytes - before.storage_bytes == 116);
+    mdb_session_close(session);
     mdb_close(db);
     char command[600];
     snprintf(command, sizeof command, "rm -rf %s", dir);
@@ -291,7 +439,7 @@ int main(void) {
                 for (int l = 0; l < 20; l++)
                     if (k != i || l != j)
                         assert(workers[i].ids[j] != workers[k].ids[l]);
-    assert(!setenv("MDB_IO_FAIL", "csv_write", 1));
+    assert(!setenv("MDB_IO_FAIL", "binary_prepare", 1));
     mdb_result injected;
     assert(mdb_execute(a, "INSERT INTO characters VALUES ('fail',1)", &injected) < 0);
     assert(injected.commit == MDB_NOT_COMMITTED && injected.error.code == MDB_IO &&
@@ -322,7 +470,11 @@ int main(void) {
     assert(system(command) == 0);
     io_failures();
     limits();
-    puts("PASS engine: CSV multiline/int64, snapshots, own writes, rollback, conflict, atomic "
+    partial_writes();
+#ifdef MDB_TESTING
+    scan_snapshot_across_cache_boundary();
+#endif
+    puts("PASS engine: binary slots, CSV import/int64, snapshots, own writes, rollback, conflict, atomic "
          "tables, ID reservations, concurrent IDs, restart, process lock");
     return 0;
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import pathlib,tempfile
 from helpers import fixture,run
-for fault,commit,expected in [('wal_write','UNKNOWN',None),('wal_fsync','UNKNOWN',None),('csv_write','NOT_COMMITTED',1),('applied_write','DURABLE',2)]:
+for fault,commit,expected in [('wal_write','UNKNOWN',None),('wal_fsync','UNKNOWN',None),('binary_prepare','NOT_COMMITTED',1),('binary_write','DURABLE',2),('applied_write','DURABLE',2),('index_insert','DURABLE',2)]:
     with tempfile.TemporaryDirectory(prefix='mdb-io-') as folder:
         p=pathlib.Path(folder);fixture(p)
         run(p,"BEGIN; INSERT INTO characters VALUES ('confirmed',1); INSERT INTO items VALUES ('confirmed',1); COMMIT;")
