@@ -29,6 +29,10 @@
 #define BINARY_READ_BUFFER 65536U
 #define CSV_RECORD_MAX (MDB_COL_MAX * (MDB_TEXT_MAX * 2U + 40U))
 #define RESERVE_BLOCK 4096U
+#ifndef MDB_WAL_BUFFER_SIZE
+#define MDB_WAL_BUFFER_SIZE 65536U
+#endif
+_Static_assert(MDB_WAL_BUFFER_SIZE > 0, "WAL buffer must not be empty");
 #define WAL_HEADER "MDBWAL1\n"
 #define WAL_MAGIC 0x314c574dU
 #define LOG_RESERVE 1U
@@ -111,6 +115,10 @@ struct mdb_db {
     size_t ncommitted, capcommitted, nsessions, max_sessions, max_changes, max_sort_rows, max_groups;
     int recovering;
     mdb_metrics metrics;
+    /* Owned by the directory owner and serialized by db->mutex. Never flushed
+     * by close: every successful durable boundary must flush explicitly. */
+    size_t wal_used;
+    unsigned char wal_buffer[MDB_WAL_BUFFER_SIZE];
 #ifdef MDB_TESTING
     void (*read_hook)(void *);
     void *read_hook_context;
@@ -1155,6 +1163,48 @@ static int wal_write(mdb_db *db, const void *data, size_t n) {
     return 0;
 #endif
 }
+static int wal_flush(mdb_db *db) {
+    if (!db->wal_used)
+        return 0;
+    const char *io = getenv("MDB_IO_FAIL");
+    if (io && !strcmp(io, "wal_flush") && db->wal_used == sizeof db->wal_buffer) {
+        (void)wal_write(db, db->wal_buffer, db->wal_used / 2);
+        errno = ENOSPC;
+        return -1;
+    }
+    if (wal_write(db, db->wal_buffer, db->wal_used))
+        return -1; /* Caller stops the engine; never retry a partially written buffer. */
+    db->wal_used = 0;
+    return 0;
+}
+static int wal_buffer_write(mdb_db *db, const void *data, size_t n) {
+#ifdef MDB_WAL_UNBUFFERED
+    /* Measurement control only: identical WAL bytes and sync policy. */
+    return wal_write(db, data, n);
+#else
+    const unsigned char *p = data;
+    while (n) {
+        size_t available = sizeof db->wal_buffer - db->wal_used;
+        if (!available) {
+            if (wal_flush(db))
+                return -1;
+            fault("wal_buffer_full");
+            available = sizeof db->wal_buffer;
+        }
+        size_t take = n < available ? n : available;
+        memcpy(db->wal_buffer + db->wal_used, p, take);
+        db->wal_used += take;
+        p += take;
+        n -= take;
+    }
+    return 0;
+#endif
+}
+static int wal_sync(mdb_db *db) {
+    if (wal_flush(db))
+        return -1;
+    return syncfd(db->walfd);
+}
 static int wal_append(mdb_db *db, uint32_t kind, uint64_t txid, const unsigned char *payload,
                       size_t n) {
     if (n > RECORD_MAX)
@@ -1166,22 +1216,27 @@ static int wal_append(mdb_db *db, uint32_t kind, uint64_t txid, const unsigned c
     put32(h + 12, (uint32_t)hashbytes(FNV_INIT, payload, n));
     put64(h + 16, txid);
     put32(h + 24, (uint32_t)hashbytes(FNV_INIT, h, 24));
-    if (wal_write(db, h, sizeof h))
+    if (wal_buffer_write(db, h, sizeof h))
         return -1;
     const char *fp = getenv("MDB_FAILPOINT"), *io = getenv("MDB_IO_FAIL");
     if (kind == LOG_ROW &&
         ((fp && strcmp(fp, "wal_partial") == 0) || (io && strcmp(io, "wal_write") == 0))) {
         if (n)
-            (void)wal_write(db, payload, n / 2);
+            (void)wal_buffer_write(db, payload, n / 2);
+        (void)wal_flush(db);
         fault("wal_partial");
         errno = EIO;
         return -1;
     }
     if (kind == LOG_APPLIED && io && strcmp(io, "applied_write") == 0) {
+        (void)wal_flush(db);
         errno = EIO;
         return -1;
     }
-    return wal_write(db, payload, n);
+    int rc = wal_buffer_write(db, payload, n);
+    if (!rc && kind == LOG_ROW && fp && !strcmp(fp, "wal_buffered"))
+        fault("wal_buffered");
+    return rc;
 }
 static int reserve_txid(mdb_db *db, uint64_t *id, mdb_error *e) {
     if (!db->txnext || db->txnext > INT64_MAX)
@@ -1191,7 +1246,7 @@ static int reserve_txid(mdb_db *db, uint64_t *id, mdb_error *e) {
             db->txnext > INT64_MAX - RESERVE_BLOCK ? INT64_MAX : db->txnext + RESERVE_BLOCK - 1;
         unsigned char p[8];
         put64(p, top);
-        if (wal_append(db, LOG_TXIDS, 0, p, 8) || syncfd(db->walfd)) {
+        if (wal_append(db, LOG_TXIDS, 0, p, 8) || wal_sync(db)) {
             db->healthy = 0;
             return fail(e, MDB_IO, "Transaction ID reservation outcome unknown; recovery required");
         }
@@ -1219,7 +1274,7 @@ static int reserve_id(mdb_db *db, size_t table, int64_t *id, mdb_error *e) {
         unsigned char p[12];
         put32(p, (uint32_t)table);
         put64(p + 4, top);
-        if (wal_append(db, LOG_RESERVE, 0, p, 12) || syncfd(db->walfd)) {
+        if (wal_append(db, LOG_RESERVE, 0, p, 12) || wal_sync(db)) {
             db->healthy = 0;
             fail(e, MDB_IO, "ID reservation outcome unknown; recovery required");
             goto done;
@@ -1753,6 +1808,7 @@ void mdb_close(mdb_db *db) {
     if (!db)
         return;
     snapshot_drop(db, db->current);
+    /* Unflushed bytes are never an acknowledged durable commit. */
     if (db->walfd >= 0)
         close(db->walfd);
     if (db->basefd >= 0)
@@ -2732,6 +2788,14 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     if (wal_append(db, LOG_COMMIT, tx->id, commit, sizeof commit))
         goto unknown;
     db->metrics.wal_records_s += seconds() - stage_started;
+    fault("before_wal_flush");
+    /* COMMIT may be in RAM until here. No successful response or data writes
+     * precede flushing every WAL byte through this commit and syncing it. */
+    stage_started = seconds();
+    if (wal_flush(db))
+        goto unknown;
+    db->metrics.wal_records_s += seconds() - stage_started;
+    fault("after_wal_flush");
     fault("before_commit_sync");
     const char *io = getenv("MDB_IO_FAIL");
     double wal_started = seconds();
@@ -2762,7 +2826,7 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     fault("before_applied");
     stage_started = seconds();
     wal_started = seconds();
-    if (wal_append(db, LOG_APPLIED, tx->id, NULL, 0) || syncfd(db->walfd))
+    if (wal_append(db, LOG_APPLIED, tx->id, NULL, 0) || wal_sync(db))
         goto durable_failure;
     db->metrics.wal_sync_s += seconds() - wal_started;
     db->metrics.completion_s += seconds() - stage_started;
