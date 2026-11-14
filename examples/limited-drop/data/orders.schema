@@ -1,0 +1,2 @@
+id INT AUTO
+drop_id INT
