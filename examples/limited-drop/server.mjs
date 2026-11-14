@@ -13,7 +13,7 @@ const assets = new Map([
 
 export function dropApi(requestDb) {
   function requireOk(result) {
-    if (!result.ok) throw new Error("DBMS request failed");
+    if (!result.ok) throw new Error(result.error?.code || "DBMS request failed");
     return result;
   }
 
@@ -89,7 +89,8 @@ export function webServer(api) {
       const bytes = await readFile(url);
       res.writeHead(200, { "Content-Type": `${type}; charset=utf-8` });
       res.end(bytes);
-    } catch {
+    } catch (error) {
+      console.error(`Drop request failed: ${error.message}`, error.cause?.code ?? "");
       json(503, { error: "Drop unavailable" });
     }
   });

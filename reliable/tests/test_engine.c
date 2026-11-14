@@ -376,6 +376,61 @@ int main(void) {
     ok(a, "ROLLBACK");
     int64_t saved = insert(a, "saved", 10);
     assert(saved > rolled);
+    char saved_query[96];
+    snprintf(saved_query, sizeof saved_query, "SELECT attack FROM characters WHERE id=%lld",
+             (long long)saved);
+    ok(a, "BEGIN");
+    ok(b, "BEGIN");
+    assert(scalar(a, "SELECT attack FROM characters WHERE id=1") == INT64_MIN);
+    assert(scalar(b, saved_query) == 10);
+    ok(a, "UPDATE characters SET attack=123 WHERE id=1");
+    char saved_update[96];
+    snprintf(saved_update, sizeof saved_update, "UPDATE characters SET attack=11 WHERE id=%lld",
+             (long long)saved);
+    ok(b, saved_update);
+    ok(a, "COMMIT");
+    assert(scalar(b, saved_query) == 11);
+    r = execute(b, "COMMIT");
+    assert(r.commit == MDB_DURABLE);
+    mdb_result_free(&r);
+    assert(scalar(a, "SELECT attack FROM characters WHERE id=1") == 123);
+    assert(scalar(a, saved_query) == 11);
+    mdb_session_close(a);
+    mdb_session_close(b);
+    mdb_close(db);
+    db = mdb_open(dir, &e);
+    assert(db);
+    a = mdb_session_open(db, &e);
+    b = mdb_session_open(db, &e);
+    assert(a && b);
+    assert(scalar(a, "SELECT attack FROM characters WHERE id=1") == 123);
+    assert(scalar(a, saved_query) == 11);
+
+    ok(a, "BEGIN");
+    ok(b, "BEGIN");
+    assert(scalar(b, "SELECT attack FROM characters WHERE id=1") == 123);
+    ok(a, "UPDATE characters SET attack=-9223372036854775808 WHERE id=1");
+    ok(b, saved_update);
+    ok(a, "COMMIT");
+    bad(b, "COMMIT", MDB_CONFLICT);
+    ok(b, "ROLLBACK");
+    snprintf(saved_update, sizeof saved_update, "UPDATE characters SET attack=10 WHERE id=%lld",
+             (long long)saved);
+    ok(a, saved_update);
+    ok(a, "BEGIN");
+    ok(b, "BEGIN");
+    int64_t pending = insert(a, "missing-at-read", 7);
+    char missing_query[128];
+    snprintf(missing_query, sizeof missing_query, "SELECT COUNT(*) FROM characters WHERE id=%lld",
+             (long long)pending);
+    assert(scalar(b, missing_query) == 0);
+    ok(b, saved_update);
+    ok(a, "COMMIT");
+    bad(b, "COMMIT", MDB_CONFLICT);
+    ok(b, "ROLLBACK");
+    snprintf(missing_query, sizeof missing_query, "DELETE FROM characters WHERE id=%lld",
+             (long long)pending);
+    ok(a, missing_query);
     assert(scalar(b, "SELECT COUNT(*) FROM characters") == 2);
     ok(a, "BEGIN");
     ok(b, "BEGIN");
@@ -388,8 +443,10 @@ int main(void) {
     assert(scalar(b, "SELECT COUNT(*) FROM items") == 1);
     ok(a, "BEGIN");
     ok(b, "BEGIN");
-    ok(a, "UPDATE characters SET attack=30 WHERE name='saved'");
-    ok(b, "UPDATE characters SET attack=40 WHERE name='saved'");
+    snprintf(saved_update, sizeof saved_update, "UPDATE characters SET attack=30 WHERE id=%lld",
+             (long long)saved);
+    ok(a, saved_update);
+    ok(b, saved_update);
     ok(a, "COMMIT");
     bad(b, "COMMIT", MDB_CONFLICT);
     bad(b, "SELECT * FROM items", MDB_FAILED);
@@ -457,6 +514,7 @@ int main(void) {
         return 1;
     }
     a = mdb_session_open(db, &e);
+    assert(scalar(a, saved_query) == 30);
     assert(scalar(a, "SELECT COUNT(*) FROM characters") == 3);
     assert(insert(a, "after-restart", 88) > before);
     ok(a, "BEGIN");

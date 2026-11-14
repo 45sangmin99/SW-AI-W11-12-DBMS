@@ -99,9 +99,10 @@ typedef struct {
 typedef struct {
     snapshot *snap;
     overlay *tables;
+    idmap *point_reads;
     uint64_t id;
-    size_t nchanges;
-    int failed, writes;
+    size_t nchanges, npoint_reads;
+    int failed, writes, global_conflicts;
 } transaction;
 struct mdb_db {
     pthread_mutex_t mutex;
@@ -343,6 +344,11 @@ static void tx_drop(mdb_db *db, transaction *tx) {
     for (size_t i = 0; i < db->ntables; i++)
         overlay_clear(&tx->tables[i], db->defs[i].ncols);
     free(tx->tables);
+    if (tx->point_reads) {
+        for (size_t i = 0; i < db->ntables; i++)
+            free(tx->point_reads[i].b);
+        free(tx->point_reads);
+    }
     snapshot_drop(db, tx->snap);
     free(tx);
 }
@@ -2079,6 +2085,27 @@ static int stage_change(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt *
     tx->writes = 1;
     return 0;
 }
+static void track_read(mdb_db *db, transaction *tx, size_t ti, int indexed, int64_t id) {
+    if (tx->global_conflicts)
+        return;
+    if (indexed && !tx->point_reads)
+        tx->point_reads = calloc(db->ntables, sizeof *tx->point_reads);
+    if (!indexed || !tx->point_reads) {
+        tx->global_conflicts = 1;
+        return;
+    }
+    idmap *reads = &tx->point_reads[ti];
+    size_t ignored;
+    if (map_get(reads, id, &ignored))
+        return;
+    /* Fall back to the global check if dependency tracking reaches its budget. */
+    if (tx->npoint_reads >= db->max_changes || map_reserve(reads, reads->n + 1)) {
+        tx->global_conflicts = 1;
+        return;
+    }
+    map_put(reads, id, 0);
+    tx->npoint_reads++;
+}
 static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt *st,
                            mdb_result *out) {
     tabledef *t = &db->defs[ti];
@@ -2102,9 +2129,11 @@ static int execute_changes(mdb_db *db, transaction *tx, size_t ti, const mdb_stm
     }
     overlay *o = &tx->tables[ti];
     view *v = tx->snap->tables[ti];
-    int64_t candidate;
+    int64_t candidate = 0;
     const char *force = getenv("MDB_FORCE_SCAN");
-    if (!(force && strcmp(force, "0")) && mdb_expr_id(st->where, &candidate)) {
+    int indexed = !(force && strcmp(force, "0")) && mdb_expr_id(st->where, &candidate);
+    track_read(db, tx, ti, indexed, candidate);
+    if (indexed) {
         out->used_index = 1;
         size_t j;
         row *base = NULL;
@@ -2282,7 +2311,7 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     overlay *o = &tx->tables[ti];
     view *v = tx->snap->tables[ti];
     int rc = -1;
-    int64_t id;
+    int64_t id = 0;
     const char *force = getenv("MDB_FORCE_SCAN");
     int indexed = !(force && strcmp(force, "0")) && mdb_expr_id(st->where, &id);
     out->used_index = indexed;
@@ -2290,6 +2319,8 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
         rc = 0;
         goto done;
     }
+    if (tx->id)
+        track_read(db, tx, ti, indexed, id);
     if (indexed) {
         uint64_t offset; /* Always execute the real tree search, including for own inserted rows. */
         int exists = view_search(v, id, &offset);
@@ -2445,7 +2476,7 @@ static snapshot *prepare_commit(mdb_db *db, transaction *tx, mdb_error *e) {
     }
     for (size_t ti = 0; ti < db->ntables; ti++) {
         overlay *o = &tx->tables[ti];
-        view *old = tx->snap->tables[ti];
+        view *old = db->current->tables[ti];
         if (!o->n) {
             s->tables[ti] = old;
             old->refs++;
@@ -2563,6 +2594,29 @@ done:
     db->metrics.storage_write_s += seconds() - started - index_elapsed;
     return rc;
 }
+static row *point_version(const view *v, int64_t id) {
+    uint64_t offset;
+    if (!view_search(v, id, &offset))
+        return NULL;
+    return view_row(v, (size_t)((offset - MDB_BIN_HEADER_SIZE) / v->file->record_size));
+}
+
+/* Both snapshots retain immutable row objects, including across slot overwrites. */
+static int dependencies_unchanged(const mdb_db *db, const transaction *tx) {
+    if (tx->global_conflicts)
+        return 0;
+    for (size_t i = 0; tx->point_reads && i < db->ntables; i++) {
+        const view *before = tx->snap->tables[i], *current = db->current->tables[i];
+        if (before == current)
+            continue;
+        const idmap *reads = &tx->point_reads[i];
+        for (size_t j = 0; j < reads->cap; j++)
+            if (reads->b[j].used &&
+                point_version(before, reads->b[j].key) != point_version(current, reads->b[j].key))
+                return 0;
+    }
+    return 1;
+}
 static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     pthread_mutex_lock(&db->mutex);
     snapshot *next = NULL;
@@ -2577,7 +2631,7 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
         rc = 0;
         goto done;
     }
-    if (tx->snap->version != db->current->version) {
+    if (tx->snap->version != db->current->version && !dependencies_unchanged(db, tx)) {
         fail(&out->error, MDB_CONFLICT,
              "Commit version changed; ROLLBACK and retry from latest state");
         goto done;
@@ -2597,7 +2651,7 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
         goto done;
     stage_started = seconds();
     unsigned char begin[8];
-    put64(begin, tx->snap->version);
+    put64(begin, db->current->version);
     if (wal_append(db, LOG_BEGIN, tx->id, begin, 8))
         goto unknown;
     uint64_t count = 0, digest = FNV_INIT;
