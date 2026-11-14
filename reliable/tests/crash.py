@@ -4,7 +4,7 @@ from helpers import fixture,run,CLI
 def kill_at(path,sql,fault):
     read_fd,write_fd=os.pipe()
     env=dict(os.environ,MDB_FAILPOINT=fault,MDB_FAILPOINT_ACTION='pause',MDB_FAILPOINT_READY_FD=str(write_fd))
-    process=subprocess.Popen([str(CLI),'--data-dir',str(path),'-e',sql],env=env,pass_fds=(write_fd,),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    process=subprocess.Popen([str(CLI),'--data-dir',str(path),'-e',sql],env=env,pass_fds=(write_fd,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
     os.close(write_fd)
     try:
         ready=select.select([read_fd],[],[],30)[0]
@@ -19,7 +19,7 @@ def kill_at(path,sql,fault):
     finally:
         os.close(read_fd)
         if process.poll() is None:process.kill();process.wait()
-cases=[('wal_partial',False),('before_commit_sync',None),('after_commit_sync',True),('after_csv_rename',True),('before_applied',True)]
+cases=[('wal_buffered',False),('before_wal_flush',False),('after_wal_flush',None),('wal_partial',False),('before_commit_sync',None),('after_commit_sync',True),('binary_partial',True),('after_binary_write',True),('before_applied',True)]
 report=[]
 for fault,expected in cases:
     with tempfile.TemporaryDirectory(prefix='mdb-crash-') as folder:
@@ -35,6 +35,48 @@ for fault,expected in cases:
             counts.append(got)
         assert counts[0]==counts[1],(fault,counts)
         report.append({'fault':fault,'external_sigkill':True,'counts_after_recovery':counts[0],'repeat_identical':True})
+# Cover overwrite/tombstone recovery, not only appending new records. Each state
+# must be entirely old or entirely committed across both tables after a kill.
+for fault,expected in cases:
+    with tempfile.TemporaryDirectory(prefix='mdb-patch-crash-') as folder:
+        p=pathlib.Path(folder);fixture(p)
+        run(p,"BEGIN; INSERT INTO characters VALUES ('confirmed',1); INSERT INTO items VALUES ('confirmed',1); COMMIT;")
+        kill_at(p,"BEGIN; UPDATE characters SET name='updated',attack=120 WHERE id=1; DELETE FROM items WHERE id=1; INSERT INTO items VALUES ('replacement',2); COMMIT;",fault)
+        states=[]
+        old=[[['confirmed','1']],[['confirmed','1']]]
+        new=[[['updated','120']],[['replacement','2']]]
+        for _ in range(2):
+            _,out=run(p,"SELECT name,attack FROM characters; SELECT name,price FROM items;")
+            got=[v['rows'] for v in out if v.get('columns')]
+            assert got in (old,new),(fault,got)
+            if expected is not None:assert got==(new if expected else old),(fault,got)
+            states.append(got)
+        assert states[0]==states[1],(fault,states)
+        report.append({'fault':'update_delete_'+fault,'external_sigkill':True,'rows_after_recovery':states[0],'repeat_identical':True})
+# Force a capacity flush halfway through an uncommitted transaction. Large
+# staged stdout goes to DEVNULL so the parent's handshake cannot deadlock.
+for fault,expected in [('wal_buffer_full',False),('before_wal_flush',False),
+                       ('after_wal_flush',None),('after_commit_sync',True)]:
+    with tempfile.TemporaryDirectory(prefix='mdb-wal-buffer-crash-') as folder:
+        p=pathlib.Path(folder);fixture(p)
+        run(p,"BEGIN; INSERT INTO characters VALUES ('confirmed',1); INSERT INTO items VALUES ('confirmed',1); COMMIT;")
+        sql='BEGIN;'+''.join("INSERT INTO %s VALUES ('bulk',%d);"%(table,i)
+                            for table in ('characters','items') for i in range(800))+'COMMIT;'
+        kill_at(p,sql,fault)
+        previous=None
+        for _ in range(2):
+            _,out=run(p,'SELECT COUNT(*) FROM characters; SELECT COUNT(*) FROM items;')
+            counts=[int(r['rows'][0][0]) for r in out]
+            assert counts in ([1,1],[801,801]),(fault,counts)
+            if expected is not None:assert counts==([801,801] if expected else [1,1]),(fault,counts)
+            if previous is not None:assert counts==previous,(fault,counts)
+            previous=counts
+        # New commits after recovery must not revive the abandoned WAL prefix.
+        run(p,"INSERT INTO characters VALUES ('after-recovery',9);")
+        _,out=run(p,'SELECT COUNT(*) FROM characters; SELECT COUNT(*) FROM items;')
+        assert [int(r['rows'][0][0]) for r in out]==[previous[0]+1,previous[1]],(fault,out)
+        report.append({'fault':'bulk_'+fault,'external_sigkill':True,
+                       'counts_after_recovery':previous,'repeat_identical':True})
 with tempfile.TemporaryDirectory(prefix='mdb-recovery-crash-') as folder:
     p=pathlib.Path(folder);fixture(p)
     run(p,"INSERT INTO characters VALUES ('confirmed',1);")

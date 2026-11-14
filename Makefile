@@ -72,7 +72,7 @@ sanitize: all | build
 clean:
 	rm -rf build
 
-# Reliable CSV/WAL engine; original Phase 1 sources and targets are preserved.
+# Reliable fixed-slot binary/WAL engine; original Phase 1 targets are preserved.
 .PHONY: reliable reliable-test asan tsan test-small-order test-crash bench bench-server
 all: reliable
 reliable:
