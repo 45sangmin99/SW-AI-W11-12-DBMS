@@ -344,7 +344,113 @@ static void partial_writes(void) {
     snprintf(command, sizeof command, "rm -rf %s", dir);
     assert(system(command) == 0);
 }
+static void catalog_ddl(void) {
+    char dir[] = "/tmp/mdb-catalog-XXXXXX";
+    assert(mkdtemp(dir));
+    file(dir, "characters.schema", "id INT AUTO\nname VARCHAR(64)\nattack INT\n");
+    file(dir, "characters.csv", "");
+    mdb_error e;
+    mdb_db *db = mdb_open(dir, &e);
+    assert(db);
+    mdb_session *a = mdb_session_open(db, &e), *b = mdb_session_open(db, &e);
+    assert(a && b);
+    ok(b, "BEGIN;");
+    /* Publishing another snapshot must not hide an older live transaction. */
+    ok(a, "INSERT INTO characters VALUES ('new version',1);");
+    bad(a, "CREATE TABLE aaa (id INT AUTO, n INT);", MDB_BUSY);
+    assert(scalar(b, "SELECT COUNT(*) FROM characters;") == 0);
+    ok(b, "ROLLBACK;");
+    ok(a, "CREATE TABLE aaa (id INT AUTO, n INT);");
+    ok(b, "INSERT INTO aaa VALUES (7);");
+    ok(a, "BEGIN;");
+    bad(a, "CREATE TABLE bbb (id INT AUTO);", MDB_STATE);
+    ok(a, "ROLLBACK;");
+    mdb_session_close(a);
+    mdb_session_close(b);
+    mdb_close(db);
+    db = mdb_open(dir, &e);
+    assert(db);
+    a = mdb_session_open(db, &e);
+    assert(scalar(a, "SELECT n FROM aaa;") == 7);
+    mdb_session_close(a);
+    mdb_close(db);
+    char command[256];
+    snprintf(command, sizeof command, "rm -rf %s", dir);
+    assert(system(command) == 0);
+}
+
+static void unique_constraints(void) {
+    char dir[] = "/tmp/mdb-unique-XXXXXX";
+    assert(mkdtemp(dir));
+    file(dir, "characters.schema", "id INT AUTO\nname VARCHAR(64)\nattack INT\n");
+    file(dir, "characters.csv", "");
+    file(dir, "items.schema", "id INT AUTO\nname VARCHAR(64)\nprice INT\n");
+    file(dir, "items.csv", "");
+    mdb_error e;
+    mdb_db *db = mdb_open(dir, &e);
+    assert(db);
+    mdb_session *a = mdb_session_open(db, &e), *b = mdb_session_open(db, &e);
+    ok(a, "INSERT INTO characters VALUES ('a',1);");
+    ok(a, "INSERT INTO characters VALUES ('b',2);");
+    ok(a, "CREATE UNIQUE INDEX unique_name ON characters(name);");
+    ok(a, "CREATE UNIQUE INDEX unique_attack ON characters(attack);");
+    bad(a, "INSERT INTO characters VALUES ('a',3);", MDB_DUPLICATE);
+    bad(a, "INSERT INTO characters VALUES ('c',2);", MDB_DUPLICATE);
+    bad(a, "UPDATE characters SET name='a';", MDB_DUPLICATE);
+    assert(scalar(a, "SELECT COUNT(*) FROM characters;") == 2);
+    ok(a, "BEGIN;");
+    ok(a, "INSERT INTO characters VALUES ('c',3);");
+    ok(a, "INSERT INTO characters VALUES ('c',4);");
+    ok(a, "INSERT INTO items VALUES ('must rollback',1);");
+    bad(a, "COMMIT;", MDB_DUPLICATE);
+    bad(a, "SELECT * FROM characters;", MDB_FAILED);
+    ok(a, "ROLLBACK;");
+    assert(scalar(a, "SELECT COUNT(*) FROM items;") == 0);
+    /* Constraints check final transaction state, allowing an atomic swap. */
+    ok(a, "BEGIN;");
+    ok(a, "UPDATE characters SET name='temp' WHERE name='a';");
+    ok(a, "UPDATE characters SET name='a' WHERE name='b';");
+    ok(a, "UPDATE characters SET name='b' WHERE name='temp';");
+    ok(a, "COMMIT;");
+    ok(a, "BEGIN;");
+    ok(a, "DELETE FROM characters WHERE name='a';");
+    ok(a, "INSERT INTO characters VALUES ('a',2);");
+    ok(a, "COMMIT;");
+    ok(a, "BEGIN;");
+    ok(b, "BEGIN;");
+    ok(a, "INSERT INTO characters VALUES ('c',3);");
+    ok(b, "INSERT INTO characters VALUES ('c',3);");
+    ok(a, "COMMIT;");
+    bad(b, "COMMIT;", MDB_CONFLICT);
+    ok(b, "ROLLBACK;");
+    assert(scalar(a, "SELECT COUNT(*) FROM characters WHERE name='c';") == 1);
+    ok(b, "BEGIN;");
+    ok(a, "INSERT INTO characters VALUES ('d',4);");
+    bad(a, "CREATE UNIQUE INDEX new_index ON characters(name);", MDB_BUSY);
+    ok(b, "ROLLBACK;");
+    ok(a, "BEGIN;");
+    bad(a, "CREATE UNIQUE INDEX new_index ON characters(name);", MDB_STATE);
+    ok(a, "ROLLBACK;");
+    mdb_session_close(a);
+    mdb_session_close(b);
+    mdb_close(db);
+    db = mdb_open(dir, &e);
+    assert(db);
+    a = mdb_session_open(db, &e);
+    bad(a, "INSERT INTO characters VALUES ('a',5);", MDB_DUPLICATE);
+    bad(a, "UPDATE characters SET attack=1 WHERE name='d';", MDB_DUPLICATE);
+    assert(scalar(a, "SELECT COUNT(*) FROM characters;") == 4);
+    ok(a, "INSERT INTO characters VALUES ('e',5);");
+    mdb_session_close(a);
+    mdb_close(db);
+    char command[256];
+    snprintf(command, sizeof command, "rm -rf %s", dir);
+    assert(system(command) == 0);
+}
+
 int main(void) {
+    unique_constraints();
+    catalog_ddl();
     char dir[] = "/tmp/mdb-engine-XXXXXX";
     assert(mkdtemp(dir));
     file(dir, "characters.schema", "# sample\nid INT AUTO\nname VARCHAR(80)\nattack INT\n");

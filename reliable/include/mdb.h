@@ -56,7 +56,9 @@ typedef enum {
     MDB_DELETE,
     MDB_BEGIN,
     MDB_COMMIT,
-    MDB_ROLLBACK
+    MDB_ROLLBACK,
+    MDB_CREATE,
+    MDB_CREATE_INDEX
 } mdb_stmt_kind;
 typedef struct {
     char *column;
@@ -85,6 +87,10 @@ typedef struct {
     int64_t limit;
     mdb_assignment *updates;
     size_t nupdates;
+    mdb_type *create_types;
+    size_t *create_sizes;
+    int if_not_exists;
+    char *index_name;
     void *arena;
 } mdb_stmt;
 int mdb_parse(const char *sql, mdb_stmt **out, mdb_error *err);

@@ -37,7 +37,50 @@ cp -R reliable/examples/demo /tmp/mini-db-demo
 
 ## SQL과 파일 형식
 
-테이블은 실행 전에 준비합니다. CREATE TABLE, ALTER TABLE, JOIN, GROUP BY, NULL, 서브쿼리는 지원하지 않습니다.
+초기 테이블은 실행 전에 준비합니다. `reliable` 엔진은 실행 중 `CREATE TABLE`도 지원합니다. `ALTER TABLE`, `JOIN`, `NULL`, 서브쿼리는 지원하지 않습니다. `reliable`의 `GROUP BY` 지원은 집계 구현과 테스트를 참조하세요.
+
+```sql
+CREATE TABLE download_events (
+  id INT AUTO,
+  download_id VARCHAR(64),
+  song_id INT,
+  approved_at INT
+);
+CREATE TABLE IF NOT EXISTS counter_outbox (
+  id INT AUTO,
+  download_id VARCHAR(64),
+  delivered INT
+);
+```
+
+`reliable`의 `CREATE TABLE`은 autocommit 전용이며 명시적 트랜잭션 안에서는 거부합니다. 다른 세션에 활성 트랜잭션/읽기 스냅샷이 남아 있으면 BUSY입니다. `IF NOT EXISTS`는 기존 테이블이면 스키마를 변경하거나 검증하지 않고 NO_CHANGES를 반환합니다. 지원 열은 첫 열 `id INT AUTO`, 이후 `INT`/`VARCHAR(1..255)`이며 중복 열·추가 AUTO·제약 조건은 거부합니다. 전체 테이블 한도는 128개입니다.
+
+새 정의는 기존 WAL의 헤더·본문 체크섬을 사용하는 단일 `LOG_CREATE` 레코드에 버전·트랜잭션 ID와 함께 기록하고 fsync 후 게시합니다. 기존 기준본과 초기 `.schema` 파일은 바꾸지 않으며 새 테이블 번호는 WAL 순서로 뒤에 추가합니다. 새 테이블 정의의 원본은 WAL이고 `.bin`은 복구 가능한 결과물입니다. 재시작 시 카탈로그를 먼저 읽고 기존 행 WAL까지 복구합니다. CREATE 승인 후 손실된 응답은 재시작 후 `IF NOT EXISTS`로 확인할 수 있습니다. 새 레코드를 포함하는 DB는 이 기능이 없는 이전 바이너리로 열 수 없습니다.
+
+`tests/test_create_table.py`는 기존 테이블 번호/데이터 보존, 여러 DDL 후 쓰기와 재시작, 잘못된 정의, CREATE의 WAL 직전·fsync 직후 외부 SIGKILL을 검사합니다. 엔진 테스트는 다른 커밋보다 오래된 스냅샷이 남은 경우에도 DDL을 거부하는지 검사합니다.
+
+### UNIQUE 인덱스 추가 (2026-11-17)
+
+기존 테이블에도 단일 열의 중복 방지 규칙을 추가할 수 있습니다.
+
+```sql
+CREATE UNIQUE INDEX download_events_download_id
+  ON download_events(download_id);
+CREATE UNIQUE INDEX IF NOT EXISTS counter_outbox_download_id
+  ON counter_outbox(download_id);
+```
+
+인덱스를 만들기 전에 기존 행 전체의 중복을 검사합니다. 중복이 있으면 생성에 실패하며 원본 행을 삭제하거나 수정하지 않습니다. 인덱스 이름은 DB 전체에서 유일하며 최대 128개입니다. `IF NOT EXISTS`는 같은 이름·테이블·열이면 NO_CHANGES이며, 같은 이름이 다른 대상에 사용됐으면 오류입니다. 인덱스 생성도 autocommit 전용이며 활성 트랜잭션이 있으면 BUSY입니다.
+
+지원 대상은 `INT` 또는 `VARCHAR` 한 열입니다. 문자열은 대소문자와 UTF-8 바이트를 정확히 비교합니다. 빈 문자열도 하나의 값이므로 중복될 수 없습니다. `NULL`, 복합 인덱스, DROP INDEX, CREATE TABLE 내부의 `UNIQUE` 문법은 지원하지 않습니다.
+
+검사는 **COMMIT 시 트랜잭션의 최종 상태**를 대상으로 수행합니다. 명시적 트랜잭션의 INSERT/UPDATE가 STAGED로 성공했더라도 COMMIT에서 중복이면 전체 트랜잭션을 거부하고 FAILED로 전환합니다. ROLLBACK이 필요하며 다른 테이블의 변경도 커밋되지 않습니다. implicit INSERT/UPDATE는 그 요청에서 바로 검사합니다. 삭제 후 같은 값 재사용, 트랜잭션 안에서 두 값 교환은 최종 상태가 유일하면 허용합니다. 중복 오류는 기존 `MDB_DUPLICATE`/`ERR_DUPLICATE_ID` 및 HTTP 409를 사용합니다. 동시 쓰기는 기존 DB 버전 충돌 검사와 커밋 잠금으로 직렬화하므로 오래된 스냅샷의 두 번째 커밋은 ERR_CONFLICT입니다.
+
+정렬 배열로 인덱스를 만들고 변경된 테이블의 인덱스만 커밋 후보에서 재구축합니다. 메모리 확보와 중복 검사는 커밋 WAL 전에 끝내고, 스냅샷과 인덱스를 함께 게시합니다. 현재는 유일성 검사용이며 일반 SELECT의 탐색 최적화에는 사용하지 않습니다. 해당 테이블에 n개 후보 행이 있으면 재구축은 O(n log n), 추가 메모리는 O(n)입니다.
+
+인덱스 정의는 버전·트랜잭션 ID·SQL을 담은 `LOG_UNIQUE` WAL 레코드를 fsync한 뒤 게시합니다. 복구는 WAL에서 인덱스가 생성된 시점에 규칙을 적용하고 이후 커밋도 검사합니다. 따라서 인덱스 생성 전에 있었지만 이미 제거된 중복을 잘못 거부하지 않습니다. 마지막 불완전 레코드는 tail 복구하고, 완전한 레코드의 손상이나 규칙 위반은 시작 실패로 처리합니다. 기존 테이블 기준본은 수정하지 않으며 새 레코드가 있는 DB는 이전 바이너리로 열 수 없습니다.
+
+`make -C reliable test`에 `test_unique_index.py`가 포함됩니다. 기존 중복 거부, 정확한 문자열/int64 비교, 재시작·WAL 순서·외부 SIGKILL·잘린 꼬리 복구를 검사합니다. C 엔진 테스트는 다중 행/다중 테이블 롤백, 갱신·삭제·값 교환, 동시 스냅샷의 충돌까지 검사합니다.
 
 ```text
 my-data/

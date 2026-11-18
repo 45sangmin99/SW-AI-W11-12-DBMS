@@ -41,6 +41,9 @@ _Static_assert(MDB_WAL_BUFFER_SIZE > 0, "WAL buffer must not be empty");
 #define LOG_ROW 4U
 #define LOG_COMMIT 5U
 #define LOG_APPLIED 6U
+#define LOG_CREATE 7U
+#define LOG_UNIQUE 8U
+#define UNIQUE_MAX 128U
 #define FNV_INIT UINT64_C(1469598103934665603)
 #define FNV_PRIME UINT64_C(1099511628211)
 
@@ -104,11 +107,23 @@ typedef struct {
     size_t nchanges;
     int failed, writes;
 } transaction;
+typedef struct {
+    const mdb_value *value; /* Kept alive by the published snapshot. */
+    int64_t row_id;
+} unique_item;
+typedef struct {
+    char name[MDB_NAME_MAX + 1];
+    size_t table, column;
+    unique_item *items;
+    size_t nitems;
+} unique_index;
 struct mdb_db {
     pthread_mutex_t mutex;
     int mutex_ready, dirfd, basefd, lockfd, walfd, healthy;
     tabledef *defs;
-    size_t ntables;
+    size_t ntables, base_tables, active_transactions;
+    unique_index unique[UNIQUE_MAX];
+    size_t nunique;
     snapshot *current;
     uint64_t txnext, txreserved;
     uint64_t *committed;
@@ -346,6 +361,7 @@ static void tx_drop(mdb_db *db, transaction *tx) {
         overlay_clear(&tx->tables[i], db->defs[i].ncols);
     free(tx->tables);
     snapshot_drop(db, tx->snap);
+    db->active_transactions--;
     free(tx);
 }
 static void fault(const char *name) {
@@ -478,6 +494,100 @@ static int find_column(const tabledef *t, const char *name) {
         if (strcmp(t->cols[i].name, name) == 0)
             return (int)i;
     return -1;
+}
+static int create_definition(const mdb_stmt *st, tabledef *t, mdb_error *e) {
+    if (st->kind != MDB_CREATE || !valid_name(st->table) || !st->ncolumns)
+        return fail(e, MDB_CORRUPT, "Invalid CREATE TABLE definition");
+    memset(t, 0, sizeof *t);
+    (void)snprintf(t->name, sizeof t->name, "%s", st->table);
+    t->ncols = st->ncolumns;
+    t->next_id = 1;
+    uint64_t h = FNV_INIT;
+    for (size_t i = 0; i < t->ncols; i++) {
+        if (!valid_name(st->columns[i]))
+            return fail(e, MDB_TYPE, "Invalid column name");
+        column *c = &t->cols[i];
+        (void)snprintf(c->name, sizeof c->name, "%s", st->columns[i]);
+        c->type = st->create_types[i];
+        c->max = st->create_sizes[i];
+        char line[128];
+        int n = c->type == MDB_INT
+                    ? snprintf(line, sizeof line, "%s INT%s\n", c->name, i ? "" : " AUTO")
+                    : snprintf(line, sizeof line, "%s VARCHAR(%zu)\n", c->name, c->max);
+        h = hashbytes(h, line, (size_t)n);
+    }
+    t->schemahash = h;
+    return 0;
+}
+static int find_unique(mdb_db *db, const char *name) {
+    for (size_t i = 0; i < db->nunique; i++)
+        if (!strcmp(db->unique[i].name, name))
+            return (int)i;
+    return -1;
+}
+static int unique_definition(mdb_db *db, const mdb_stmt *st, unique_index *index, mdb_error *e) {
+    if (st->kind != MDB_CREATE_INDEX || !valid_name(st->index_name) || st->ncolumns != 1)
+        return fail(e, MDB_SYNTAX, "Expected a named single-column UNIQUE index");
+    int ti = find_table(db, st->table);
+    if (ti < 0)
+        return fail(e, MDB_UNKNOWN_TABLE, "Unknown indexed table");
+    int ci = find_column(&db->defs[ti], st->columns[0]);
+    if (ci < 0)
+        return fail(e, MDB_UNKNOWN_COLUMN, "Unknown indexed column");
+    memset(index, 0, sizeof *index);
+    (void)snprintf(index->name, sizeof index->name, "%s", st->index_name);
+    index->table = (size_t)ti;
+    index->column = (size_t)ci;
+    return 0;
+}
+static int unique_compare(const void *a, const void *b) {
+    const mdb_value *x = ((const unique_item *)a)->value, *y = ((const unique_item *)b)->value;
+    if (x->type == MDB_INT)
+        return (x->i > y->i) - (x->i < y->i);
+    return strcmp(x->s, y->s);
+}
+/* Build an ordered index over the final candidate rows, including own writes
+ * and deletes. VARCHAR equality is exact UTF-8 byte equality, never hash-only. */
+static int unique_build(const unique_index *index, const view *v, const rowset *set,
+                        unique_item **out, size_t *count, mdb_error *e) {
+    size_t cap = v ? v->n : set->n, n = 0;
+    if (cap > SIZE_MAX / sizeof(unique_item))
+        return fail(e, MDB_LIMIT, "UNIQUE index size limit");
+    unique_item *items = malloc((cap ? cap : 1) * sizeof *items);
+    if (!items)
+        return fail(e, MDB_NOMEM, "Cannot allocate UNIQUE index");
+    for (size_t i = 0; i < cap; i++) {
+        row *r = v ? view_row(v, i) : set->v[i];
+        if (r)
+            items[n++] = (unique_item){.value = &r->v[index->column], .row_id = r->v[0].i};
+    }
+    qsort(items, n, sizeof *items, unique_compare);
+    for (size_t i = 1; i < n; i++)
+        if (!unique_compare(&items[i - 1], &items[i])) {
+            char message[256];
+            (void)snprintf(message, sizeof message, "UNIQUE index %s rejects duplicate values", index->name);
+            free(items);
+            return fail(e, MDB_DUPLICATE, message);
+        }
+    *out = items;
+    *count = n;
+    return 0;
+}
+static int unique_check_replay(mdb_db *db, rowset *sets, overlay *pending, mdb_error *e) {
+    for (size_t i = 0; i < db->nunique; i++) {
+        const unique_index *index = &db->unique[i];
+        if (!pending[index->table].n)
+            continue;
+        unique_item *items = NULL;
+        size_t count = 0;
+        if (unique_build(index, NULL, &sets[index->table], &items, &count, e)) {
+            if (e && e->code == MDB_DUPLICATE)
+                e->code = MDB_CORRUPT;
+            return -1;
+        }
+        free(items);
+    }
+    return 0;
 }
 static void put32(unsigned char *p, uint32_t x) {
     for (size_t i = 0; i < 4; i++)
@@ -907,7 +1017,14 @@ static int discover(mdb_db *db, mdb_error *e) {
         close(scanfd);
         return fail(e, MDB_IO, "Cannot scan data directory");
     }
-    size_t cap = 0;
+    /* Row-slot retain/release callbacks keep tabledef addresses. Reserve the
+     * catalog limit up front so online CREATE never relocates those contexts. */
+    size_t cap = 128;
+    db->defs = calloc(cap, sizeof *db->defs);
+    if (!db->defs) {
+        closedir(d);
+        return fail(e, MDB_NOMEM, "Allocation failed");
+    }
     struct dirent *ent;
     int rc = -1;
     errno = 0;
@@ -1400,6 +1517,49 @@ static int replay_commit(mdb_db *db, rowset *sets, overlay *pending, mdb_error *
     }
     return 0;
 }
+/* CREATE definitions live in the WAL, never in discoverable .schema files.
+ * Load complete, checksummed catalog records before allocating recovery arrays.
+ * Baseline table indices stay fixed; new tables append in WAL order. */
+static int wal_catalog(mdb_db *db, mdb_error *e) {
+    struct stat st;
+    if (fstat(db->walfd, &st) || st.st_size < 8)
+        return fail(e, MDB_CORRUPT, "Required WAL header missing");
+    uint64_t offset = 8;
+    while (offset + 32 <= (uint64_t)st.st_size) {
+        unsigned char h[32];
+        if (full_pread(db->walfd, h, sizeof h, offset))
+            return fail(e, MDB_IO, "Cannot read WAL catalog");
+        uint32_t kind = get32(h + 4), n = get32(h + 8);
+        if (get32(h) != WAL_MAGIC || get32(h + 28) ||
+            get32(h + 24) != (uint32_t)hashbytes(FNV_INIT, h, 24) || n > RECORD_MAX ||
+            kind < LOG_RESERVE || kind > LOG_UNIQUE)
+            return fail(e, MDB_CORRUPT, "Invalid WAL catalog header");
+        if (n > (uint64_t)st.st_size - offset - 32)
+            break; /* The normal replay repairs only incomplete trailing records. */
+        if (kind == LOG_CREATE) {
+            if (n < 9 || n > MDB_SQL_MAX + 8 || db->ntables == 128)
+                return fail(e, MDB_CORRUPT, "Invalid WAL CREATE size");
+            unsigned char p[MDB_SQL_MAX + 9];
+            if (full_pread(db->walfd, p, n, offset + 32))
+                return fail(e, MDB_IO, "Cannot read WAL CREATE");
+            if (get32(h + 12) != (uint32_t)hashbytes(FNV_INIT, p, n) || memchr(p + 8, 0, n - 8))
+                return fail(e, MDB_CORRUPT, "Invalid WAL CREATE checksum or text");
+            p[n] = 0;
+            mdb_stmt *definition = NULL;
+            if (mdb_parse((char *)p + 8, &definition, e))
+                return fail(e, MDB_CORRUPT, "Invalid WAL CREATE SQL");
+            tabledef t;
+            int bad = create_definition(definition, &t, e);
+            mdb_stmt_free(definition);
+            if (bad || find_table(db, t.name) >= 0)
+                return fail(e, MDB_CORRUPT, "Duplicate or invalid WAL table");
+            db->defs[db->ntables++] = t;
+        }
+        offset += 32 + (uint64_t)n;
+    }
+    return 0;
+}
+
 static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e) {
     struct stat st;
     if (fstat(db->walfd, &st) || st.st_size < 8)
@@ -1411,6 +1571,7 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
     if (!pending)
         return fail(e, MDB_NOMEM, "Allocation failed");
     uint64_t offset = 8, active = 0, count = 0, digest = FNV_INIT, beginver = 0;
+    size_t catalog_count = db->base_tables;
     int rc = -1;
     while (offset < (uint64_t)st.st_size) {
         uint64_t remaining = (uint64_t)st.st_size - offset;
@@ -1426,7 +1587,7 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
         uint64_t txid = get64(h + 16);
         if (get32(h) != WAL_MAGIC || get32(h + 28) != 0 ||
             get32(h + 24) != (uint32_t)hashbytes(FNV_INIT, h, 24) || n > RECORD_MAX ||
-            kind < LOG_RESERVE || kind > LOG_APPLIED) {
+            kind < LOG_RESERVE || kind > LOG_UNIQUE) {
             fail(e, MDB_CORRUPT, "Invalid WAL record header");
             goto done;
         }
@@ -1452,7 +1613,7 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
         }
         int bad = 0;
         if (kind == LOG_RESERVE) {
-            if (n != 12 || txid || get32(p) >= db->ntables)
+            if (n != 12 || txid || get32(p) >= catalog_count)
                 bad = 1;
             else {
                 tabledef *t = &db->defs[get32(p)];
@@ -1488,6 +1649,12 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
                     free(p);
                     goto done;
                 }
+                if (ti >= catalog_count) {
+                    row_drop(c.value, db->defs[ti].ncols);
+                    free(p);
+                    fail(e, MDB_CORRUPT, "WAL row precedes table creation");
+                    goto done;
+                }
                 size_t ignored;
                 if (map_get(&pending[ti].map, c.id, &ignored)) {
                     row_drop(c.value, db->defs[ti].ncols);
@@ -1509,7 +1676,8 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
                 get64(p + 16) != *version + 1)
                 bad = 1;
             else {
-                if (ledger_prepare(db) || replay_commit(db, sets, pending, e)) {
+                if (ledger_prepare(db) || replay_commit(db, sets, pending, e) ||
+                    unique_check_replay(db, sets, pending, e)) {
                     free(p);
                     if (!e || !e->code)
                         fail(e, MDB_NOMEM, "Allocation failed");
@@ -1520,6 +1688,62 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
                 active = 0;
                 for (size_t i = 0; i < db->ntables; i++)
                     overlay_clear(&pending[i], db->defs[i].ncols);
+            }
+        } else if (kind == LOG_CREATE) {
+            for (size_t i = 0; i < db->ntables; i++)
+                overlay_clear(&pending[i], db->defs[i].ncols);
+            active = 0; /* A previous process may have left an uncommitted tail. */
+            if (n < 9 || !txid || txid > db->txreserved ||
+                catalog_count >= db->ntables || get64(p) != *version || *version == UINT64_MAX)
+                bad = 1;
+            else if (ledger_prepare(db)) {
+                free(p);
+                fail(e, MDB_NOMEM, "Allocation failed");
+                goto done;
+            } else {
+                db->committed[db->ncommitted++] = txid;
+                catalog_count++;
+                (*version)++;
+            }
+        } else if (kind == LOG_UNIQUE) {
+            for (size_t i = 0; i < db->ntables; i++)
+                overlay_clear(&pending[i], db->defs[i].ncols);
+            active = 0;
+            if (n < 9 || n > MDB_SQL_MAX + 8 || !txid || txid > db->txreserved ||
+                get64(p) != *version || *version == UINT64_MAX || db->nunique == UNIQUE_MAX ||
+                memchr(p + 8, 0, n - 8))
+                bad = 1;
+            else {
+                char sql[MDB_SQL_MAX + 1];
+                memcpy(sql, p + 8, n - 8);
+                sql[n - 8] = 0;
+                mdb_stmt *st = NULL;
+                unique_index index;
+                int invalid = mdb_parse(sql, &st, e);
+                if (!invalid)
+                    invalid = unique_definition(db, st, &index, e);
+                mdb_stmt_free(st);
+                if (invalid || index.table >= catalog_count || find_unique(db, index.name) >= 0) {
+                    free(p);
+                    fail(e, MDB_CORRUPT, "Invalid WAL UNIQUE definition");
+                    goto done;
+                }
+                unique_item *items = NULL;
+                size_t nitems = 0;
+                if (unique_build(&index, NULL, &sets[index.table], &items, &nitems, e) ||
+                    ledger_prepare(db)) {
+                    free(items);
+                    free(p);
+                    if (e && e->code == MDB_DUPLICATE)
+                        e->code = MDB_CORRUPT;
+                    else if (!e || !e->code)
+                        fail(e, MDB_NOMEM, "Cannot restore UNIQUE catalog");
+                    goto done;
+                }
+                free(items); /* Final retained indexes use the recovered views below. */
+                db->unique[db->nunique++] = index;
+                db->committed[db->ncommitted++] = txid;
+                (*version)++;
             }
         } else if (kind == LOG_APPLIED) {
             if (n || !txid)
@@ -1543,6 +1767,10 @@ static int wal_replay(mdb_db *db, rowset *sets, uint64_t *version, mdb_error *e)
         offset += 32 + (uint64_t)n;
     }
     db->txnext = db->txreserved + 1;
+    if (catalog_count != db->ntables) {
+        fail(e, MDB_CORRUPT, "WAL catalog count mismatch");
+        goto done;
+    }
     for (size_t i = 0; i < db->ntables; i++)
         db->defs[i].next_id = db->defs[i].reserved + 1;
     rc = 0;
@@ -1684,7 +1912,7 @@ static int recover(mdb_db *db, mdb_error *e) {
         fail(e, MDB_NOMEM, "Allocation failed");
         goto done;
     }
-    for (size_t i = 0; i < db->ntables; i++) {
+    for (size_t i = 0; i < db->base_tables; i++) {
         char name[MDB_NAME_MAX + 16];
         (void)snprintf(name, sizeof name, "%s.csv", db->defs[i].name);
         int fd = openat(db->basefd, name, O_RDONLY);
@@ -1715,6 +1943,11 @@ static int recover(mdb_db *db, mdb_error *e) {
             goto done;
         if (i == 0)
             fault("recovery_write");
+    }
+    for (size_t i = 0; i < db->nunique; i++) {
+        unique_index *index = &db->unique[i];
+        if (unique_build(index, s->tables[index->table], NULL, &index->items, &index->nitems, e))
+            goto done;
     }
     for (size_t i = 0; i < db->ntables; i++)
         if (install_view(db, i)) {
@@ -1792,12 +2025,13 @@ mdb_db *mdb_open(const char *directory, mdb_error *e) {
         goto bad;
     if (verify_baseline(db, e))
         goto bad;
+    db->base_tables = db->ntables;
     db->walfd = openat(db->dirfd, ".mdb.wal", O_RDWR | O_APPEND);
     if (db->walfd < 0) {
         fail(e, MDB_CORRUPT, "Required WAL missing");
         goto bad;
     }
-    if (recover(db, e))
+    if (wal_catalog(db, e) || recover(db, e))
         goto bad;
     return db;
 bad:
@@ -1807,6 +2041,8 @@ bad:
 void mdb_close(mdb_db *db) {
     if (!db)
         return;
+    for (size_t i = 0; i < db->nunique; i++)
+        free(db->unique[i].items);
     snapshot_drop(db, db->current);
     /* Unflushed bytes are never an acknowledged durable commit. */
     if (db->walfd >= 0)
@@ -1891,13 +2127,14 @@ static transaction *tx_begin(mdb_db *db, int need_id, mdb_error *e) {
         fail(e, MDB_NOMEM, "Allocation failed");
         return NULL;
     }
+    pthread_mutex_lock(&db->mutex);
     tx->tables = calloc(db->ntables, sizeof *tx->tables);
     if (!tx->tables) {
+        pthread_mutex_unlock(&db->mutex);
         free(tx);
         fail(e, MDB_NOMEM, "Allocation failed");
         return NULL;
     }
-    pthread_mutex_lock(&db->mutex);
     if (!db->healthy) {
         fail(e, MDB_IO, "Engine requires recovery");
         goto bad;
@@ -1906,6 +2143,7 @@ static transaction *tx_begin(mdb_db *db, int need_id, mdb_error *e) {
         goto bad;
     tx->snap = db->current;
     tx->snap->refs++;
+    db->active_transactions++;
     pthread_mutex_unlock(&db->mutex);
     return tx;
 bad:
@@ -2733,6 +2971,8 @@ done:
 static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     pthread_mutex_lock(&db->mutex);
     snapshot *next = NULL;
+    unique_item *unique_next[UNIQUE_MAX] = {0};
+    size_t unique_counts[UNIQUE_MAX] = {0};
     int rc = -1;
     out->txid = tx->id;
     if (!db->healthy) {
@@ -2762,6 +3002,14 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     db->metrics.prepare_s += seconds() - stage_started;
     if (!next)
         goto done;
+    /* Validate and reserve every affected UNIQUE index before any commit WAL.
+     * A failure leaves the published snapshot/indexes and all other tables intact. */
+    for (size_t i = 0; i < db->nunique; i++) {
+        unique_index *index = &db->unique[i];
+        if (tx->tables[index->table].n &&
+            unique_build(index, next->tables[index->table], NULL, &unique_next[i], &unique_counts[i], &out->error))
+            goto done;
+    }
     stage_started = seconds();
     unsigned char begin[8];
     put64(begin, tx->snap->version);
@@ -2821,6 +3069,13 @@ static int commit_tx(mdb_db *db, transaction *tx, mdb_result *out) {
     snapshot *old = db->current;
     db->current = next;
     next = NULL;
+    for (size_t i = 0; i < db->nunique; i++)
+        if (unique_next[i]) {
+            free(db->unique[i].items);
+            db->unique[i].items = unique_next[i];
+            db->unique[i].nitems = unique_counts[i];
+            unique_next[i] = NULL;
+        }
     snapshot_drop(db, old);
     db->metrics.publish_s += seconds() - stage_started;
     fault("before_applied");
@@ -2845,11 +3100,164 @@ durable_failure:
     fail(&out->error, MDB_IO,
          "Commit is durable; binary/completion needs recovery before further SQL");
 done:
+    for (size_t i = 0; i < db->nunique; i++)
+        free(unique_next[i]);
     if (next)
         snapshot_drop(db, next);
     pthread_mutex_unlock(&db->mutex);
     return rc;
 }
+/* DDL is an autocommit operation and requires no active snapshots. This keeps
+ * table indices and snapshot/overlay sizes stable for every running query. */
+static int execute_create(mdb_db *db, const mdb_stmt *st, const char *sql, mdb_result *out) {
+    int rc = -1, added = 0;
+    pthread_mutex_lock(&db->mutex);
+    if (!db->healthy) {
+        out->recovery_required = 1;
+        fail(&out->error, MDB_IO, "Engine requires recovery");
+        goto done;
+    }
+    if (find_table(db, st->table) >= 0) {
+        if (st->if_not_exists) {
+            out->commit = MDB_NO_CHANGES;
+            rc = 0;
+        } else
+            fail(&out->error, MDB_DUPLICATE, "Table already exists");
+        goto done;
+    }
+    if (db->active_transactions) {
+        fail(&out->error, MDB_BUSY, "CREATE TABLE requires no active transactions");
+        goto done;
+    }
+    if (db->ntables == 128 || db->current->version == UINT64_MAX) {
+        fail(&out->error, MDB_LIMIT, "Catalog or version limit reached");
+        goto done;
+    }
+    tabledef t;
+    if (create_definition(st, &t, &out->error))
+        goto done;
+    view **tables = realloc(db->current->tables, (db->ntables + 1) * sizeof *tables);
+    if (!tables) {
+        fail(&out->error, MDB_NOMEM, "Allocation failed");
+        goto done;
+    }
+    db->current->tables = tables;
+    size_t ti = db->ntables;
+    db->defs[ti] = t;
+    db->current->tables[ti] = NULL;
+    db->ntables++;
+    added = 1;
+    view *v = build_view(db, ti, NULL, 0, db->current->version + 1, &out->error);
+    if (!v)
+        goto done;
+    db->current->tables[ti] = v;
+    if (ledger_prepare(db)) {
+        fail(&out->error, MDB_NOMEM, "Allocation failed");
+        goto done;
+    }
+    if (reserve_txid(db, &out->txid, &out->error))
+        goto done;
+    unsigned char payload[MDB_SQL_MAX + 8];
+    put64(payload, db->current->version);
+    size_t n = strlen(sql);
+    memcpy(payload + 8, sql, n);
+    fault("create_pre_wal");
+    if (wal_append(db, LOG_CREATE, out->txid, payload, n + 8) || wal_sync(db)) {
+        db->healthy = 0;
+        out->commit = MDB_UNKNOWN;
+        out->recovery_required = 1;
+        fail(&out->error, MDB_IO, "CREATE outcome unknown; restart to recover");
+        goto done;
+    }
+    out->commit = MDB_DURABLE;
+    db->committed[db->ncommitted++] = out->txid;
+    db->current->version++;
+    fault("create_durable");
+    if (install_view(db, ti) || syncfd(db->dirfd)) {
+        db->healthy = 0;
+        out->recovery_required = 1;
+        fail(&out->error, MDB_IO, "CREATE is durable; table needs recovery");
+        goto done;
+    }
+    added = 0;
+    out->affected = 1;
+    (void)snprintf(out->state, sizeof out->state, "COMMITTED");
+    rc = 0;
+done:
+    if (added && out->commit == MDB_NOT_COMMITTED) {
+        size_t ti = db->ntables - 1;
+        view_drop(db, db->current->tables[ti], ti);
+        db->current->tables[ti] = NULL;
+        db->ntables--;
+    }
+    pthread_mutex_unlock(&db->mutex);
+    return rc;
+}
+
+static int execute_unique(mdb_db *db, const mdb_stmt *st, const char *sql, mdb_result *out) {
+    int rc = -1;
+    unique_index index = {0};
+    pthread_mutex_lock(&db->mutex);
+    if (!db->healthy) {
+        out->recovery_required = 1;
+        fail(&out->error, MDB_IO, "Engine requires recovery");
+        goto done;
+    }
+    if (unique_definition(db, st, &index, &out->error))
+        goto done;
+    int found = find_unique(db, index.name);
+    if (found >= 0) {
+        const unique_index *old = &db->unique[found];
+        if (st->if_not_exists && old->table == index.table && old->column == index.column) {
+            out->commit = MDB_NO_CHANGES;
+            rc = 0;
+        } else
+            fail(&out->error, MDB_DUPLICATE, "Index name already exists or targets another column");
+        goto done;
+    }
+    if (db->active_transactions) {
+        fail(&out->error, MDB_BUSY, "CREATE UNIQUE INDEX requires no active transactions");
+        goto done;
+    }
+    if (db->nunique == UNIQUE_MAX || db->current->version == UINT64_MAX) {
+        fail(&out->error, MDB_LIMIT, "UNIQUE catalog or version limit reached");
+        goto done;
+    }
+    if (unique_build(&index, db->current->tables[index.table], NULL, &index.items, &index.nitems, &out->error))
+        goto done;
+    if (ledger_prepare(db)) {
+        fail(&out->error, MDB_NOMEM, "Allocation failed");
+        goto done;
+    }
+    if (reserve_txid(db, &out->txid, &out->error))
+        goto done;
+    unsigned char payload[MDB_SQL_MAX + 8];
+    put64(payload, db->current->version);
+    size_t n = strlen(sql);
+    memcpy(payload + 8, sql, n);
+    fault("unique_pre_wal");
+    if (wal_append(db, LOG_UNIQUE, out->txid, payload, n + 8) || wal_sync(db)) {
+        db->healthy = 0;
+        out->commit = MDB_UNKNOWN;
+        out->recovery_required = 1;
+        fail(&out->error, MDB_IO, "UNIQUE index outcome unknown; restart to recover");
+        goto done;
+    }
+    out->commit = MDB_DURABLE;
+    db->committed[db->ncommitted++] = out->txid;
+    db->current->version++;
+    fault("unique_durable");
+    db->unique[db->nunique++] = index;
+    index.items = NULL;
+    out->affected = 1;
+    (void)snprintf(out->state, sizeof out->state, "COMMITTED");
+    rc = 0;
+done:
+    free(index.items);
+    pthread_mutex_unlock(&db->mutex);
+    return rc;
+}
+
 static void clear_result_data(mdb_result *out) {
     mdb_result saved = *out;
     mdb_result_free(out);
@@ -2911,6 +3319,14 @@ int mdb_execute(mdb_session *session, const char *sql, mdb_result *out) {
         out->txid = session->tx->id;
         (void)snprintf(out->state, sizeof out->state, "ACTIVE");
         rc = 0;
+        goto finish;
+    }
+    if (st->kind == MDB_CREATE || st->kind == MDB_CREATE_INDEX) {
+        if (session->tx) {
+            session->tx->failed = 1;
+            fail(&out->error, MDB_STATE, "DDL is autocommit only; end the transaction first");
+        } else
+            rc = st->kind == MDB_CREATE ? execute_create(db, st, sql, out) : execute_unique(db, st, sql, out);
         goto finish;
     }
     if (st->kind == MDB_COMMIT) {

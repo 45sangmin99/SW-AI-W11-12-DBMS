@@ -575,6 +575,98 @@ static void parse_delete(parser *p, mdb_stmt *s) {
         s->where = expression(p);
     }
 }
+static void parse_create(parser *p, mdb_stmt *s) {
+    s->kind = MDB_CREATE;
+    advance(p);
+    if (keyword(p, "unique")) {
+        s->kind = MDB_CREATE_INDEX;
+        advance(p);
+        if (!require_word(p, "index"))
+            return;
+        if (keyword(p, "if")) {
+            advance(p);
+            if (!require_word(p, "not") || !require_word(p, "exists"))
+                return;
+            s->if_not_exists = 1;
+        }
+        s->index_name = identifier(p);
+        if (!require_word(p, "on"))
+            return;
+        s->table = identifier(p);
+        if (!require(p, T_LP, "Expected '(' before indexed column"))
+            return;
+        s->columns = allocate(p, sizeof *s->columns);
+        if (!s->columns)
+            return;
+        s->columns[0] = identifier(p);
+        s->ncolumns = 1;
+        (void)require(p, T_RP, "Expected ')' after one indexed column");
+        return;
+    }
+    if (!require_word(p, "table"))
+        return;
+    if (keyword(p, "if")) {
+        advance(p);
+        if (!require_word(p, "not") || !require_word(p, "exists"))
+            return;
+        s->if_not_exists = 1;
+    }
+    s->table = identifier(p);
+    if (!require(p, T_LP, "Expected '(' after table name"))
+        return;
+    s->columns = allocate(p, MDB_COL_MAX * sizeof *s->columns);
+    s->create_types = allocate(p, MDB_COL_MAX * sizeof *s->create_types);
+    s->create_sizes = allocate(p, MDB_COL_MAX * sizeof *s->create_sizes);
+    if (p->failed)
+        return;
+    do {
+        size_t i = s->ncolumns;
+        if (i == MDB_COL_MAX) {
+            (void)fail(p, MDB_LIMIT, p->current.offset, "Column count limit exceeded");
+            return;
+        }
+        s->columns[i] = identifier(p);
+        if (p->failed)
+            return;
+        for (size_t j = 0; j < i; j++)
+            if (!strcmp(s->columns[i], s->columns[j])) {
+                (void)fail(p, MDB_DUPLICATE, p->current.offset, "Duplicate column");
+                return;
+            }
+        if (keyword(p, "int")) {
+            s->create_types[i] = MDB_INT;
+            advance(p);
+        } else if (keyword(p, "varchar")) {
+            s->create_types[i] = MDB_STRING;
+            advance(p);
+            if (!require(p, T_LP, "Expected VARCHAR size"))
+                return;
+            if (p->current.kind != T_INT || p->current.integer < 1 ||
+                p->current.integer > MDB_TEXT_MAX) {
+                (void)fail(p, MDB_TYPE, p->current.offset, "VARCHAR size must be 1..255");
+                return;
+            }
+            s->create_sizes[i] = (size_t)p->current.integer;
+            advance(p);
+            if (!require(p, T_RP, "Expected ')' after VARCHAR size"))
+                return;
+        } else {
+            (void)fail(p, MDB_TYPE, p->current.offset, "Expected INT or VARCHAR(n)");
+            return;
+        }
+        if (i == 0) {
+            if (strcmp(s->columns[i], "id") || s->create_types[i] != MDB_INT) {
+                (void)fail(p, MDB_TYPE, p->current.offset, "First column must be id INT AUTO");
+                return;
+            }
+            if (!require_word(p, "auto"))
+                return;
+        }
+        s->ncolumns++;
+    } while (take(p, T_COMMA));
+    (void)require(p, T_RP, "Expected ')' after table definition");
+}
+
 int mdb_parse(const char *sql, mdb_stmt **out, mdb_error *err) {
     mdb_error local = {0};
     if (!err)
@@ -611,7 +703,9 @@ int mdb_parse(const char *sql, mdb_stmt **out, mdb_error *err) {
     stmt->arena = arena;
     stmt->limit = -1;
     advance(&p);
-    if (keyword(&p, "select"))
+    if (keyword(&p, "create"))
+        parse_create(&p, stmt);
+    else if (keyword(&p, "select"))
         parse_select(&p, stmt);
     else if (keyword(&p, "insert"))
         parse_insert(&p, stmt);

@@ -48,6 +48,8 @@ test: test-queue test-lifecycle all $(BUILD)/test-sql $(BUILD)/test-bpt $(BUILD)
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_binary_storage.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_group_by.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/integration.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_create_table.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_unique_index.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/corruption.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/io_failures.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/model.py
