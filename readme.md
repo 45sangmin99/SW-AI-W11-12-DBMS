@@ -102,3 +102,25 @@ SQL 처리, 데이터 저장과 조회, 인덱스, 트랜잭션 및 장애 복�
 
 - 바이너리 슬롯: 100만 행 테이블에서 한 행 수정·삭제, 각 1회 측정. 커밋 시간 포함. 레코드 크기 68바이트이며 수정·삭제 시 데이터 파일 기록량도 68바이트(WAL 제외).
 - WAL 버퍼링: 100만 건 INSERT를 단일 트랜잭션으로 실행, 각 조건 3회 측정의 중앙값. WAL 기록량은 변경 전후 모두 73,010,948바이트.
+
+
+## 통합 버전 사용법
+
+상민 엔진의 바이너리 저장·WAL·스냅샷을 기준으로 대화형 콘솔과 한정 상품 주문 데모를 통합했습니다.
+
+- **비관적 동시성 제어**: 일반 조회는 스냅샷을 유지하고, `SELECT … FOR UPDATE`와 변경 명령은 잠금을 확보한 뒤 최신 데이터를 읽습니다. 같은 행은 기다리고 서로 다른 행의 변경은 각각 커밋할 수 있습니다. 잠금 대기에는 타임아웃이 있습니다.
+- **집계 확장**: `SUM`, `AVG`, `MIN`, `MAX`, UTC 월별 집계 `MONTH(Unix초)`를 지원합니다. 기간 필터는 INT 열의 WHERE 비교를 사용합니다.
+- **페이지 조회**: 응답당 1만 행 제한은 유지하면서 `LIMIT … OFFSET …`으로 나눠 읽습니다. 같은 트랜잭션에서 여러 페이지를 읽으면 같은 스냅샷을 사용합니다.
+- **콘솔·데모**: `.tables`, `.schema`, 다중 행 입력을 지원하는 콘솔과 실제 HTTP로 주문하는 데모를 제공합니다.
+
+```sh
+make -C reliable
+demo_dir=$(mktemp -d)
+cp examples/limited-drop/data/* "$demo_dir/"
+./reliable/build/mini-db-console --data-dir "$demo_dir"
+make -C reliable test test-crash test-console test-final test-demo
+```
+
+C11 컴파일러, Make, Python 3이 필요합니다. 주문 데모 검사는 Node.js도 사용합니다. 데이터 디렉터리는 초기 `.schema`/`.csv`를 준비한 경로를 사용하며, 종료 후 같은 경로로 실행하면 WAL을 복구합니다.
+
+잠금의 범위와 타임아웃, SQL 문법과 한계, 재현 명령은 [통합 엔진 문서](docs/final-integration.md), 상품 주문 실행법은 [데모 문서](examples/limited-drop/README.md)에 정리했습니다. 기존 성능 표는 바이너리 슬롯과 WAL 버퍼링에 대한 이전 측정이며 새 잠금 방식의 성능 결과는 아닙니다.

@@ -1,0 +1,27 @@
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=Instrument+Sans:wght@400;500;600;700&display=swap');
+:root { color-scheme: light; font-family: "Instrument Sans", sans-serif; color: #141411; background: #f7f6f0; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.top { height: 70px; display: flex; justify-content: space-between; align-items: center; padding: 0 clamp(22px, 5vw, 80px); border-bottom: 1px solid #d9d7ce; font-weight: 700; letter-spacing: .12em; font-size: 12px; }
+.top a { color: inherit; text-decoration: none; font-size: 17px; letter-spacing: -.04em; }
+.top a span { margin-left: 4px; font-size: 10px; vertical-align: top; }
+.layout { display: grid; grid-template-columns: 1.35fr 1fr; align-items: center; gap: clamp(30px, 6vw, 108px); max-width: 1450px; margin: auto; padding: clamp(20px, 4vw, 64px); }
+.art { background: #dfded5; min-height: 630px; padding: 40px; display: grid; place-items: center; }
+.print { width: min(100%, 328px); aspect-ratio: 3 / 4; background: #171815; color: #d8ff3d; box-shadow: 14px 19px 34px #25271c4d; overflow: hidden; position: relative; padding: 7%; }
+.print b { font: 800 clamp(30px, 6vw, 80px)/.82 "Barlow Condensed", Impact, sans-serif; letter-spacing: -.02em; position: relative; z-index: 1; }
+.print small { position: absolute; bottom: 6%; left: 7%; letter-spacing: .16em; font-size: 10px; }
+.orbit { position: absolute; width: 125%; aspect-ratio: 1; left: 9%; top: 24%; transform: rotate(-26deg) scaleY(.72); border-radius: 50%; background: repeating-radial-gradient(circle, transparent 0 8px, #d8ff3d 9px 11px, transparent 12px 17px); }
+.label { font-size: 12px; letter-spacing: .16em; font-weight: 700; }
+h1 { font: 800 clamp(64px, 9vw, 132px)/.78 "Barlow Condensed", Impact, sans-serif; margin: 22px 0 28px; letter-spacing: -.025em; text-transform: uppercase; }
+.description { color: #57564c; line-height: 1.6; }
+.stock { margin: 26px 0 10px; font-weight: 700; }
+button { font: inherit; cursor: pointer; }
+button:disabled { opacity: .6; cursor: default; }
+.order { width: 100%; border: 0; background: #d8ff3d; color: #151610; padding: 16px; font-weight: 700; }
+.refresh { border: 0; background: transparent; color: #424136; text-decoration: underline; padding: 12px 0; }
+.status { min-height: 1.4em; margin: 0 0 18px; font-size: 14px; }
+.history { border-top: 1px solid #d9d7ce; padding-top: 8px; }
+.history h2 { font-size: 14px; }
+.history ul { padding: 0; list-style: none; margin: 0; }
+.history li { padding: 7px 0; font-size: 13px; color: #555448; }
+@media (max-width: 760px) { .layout { grid-template-columns: 1fr; } .art { min-height: auto; padding: 32px; } .print { width: min(100%, 270px); } }

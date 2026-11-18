@@ -1,0 +1,101 @@
+CC = cc
+CPPFLAGS = -Iinclude -D_POSIX_C_SOURCE=200809L -D_FILE_OFFSET_BITS=64
+CFLAGS = -std=c11 -O2 -g -Wall -Wextra -Werror -pedantic
+LDLIBS = -pthread
+BUILD ?= build
+CORE = src/common.c src/sql.c src/bpt.c src/binary.c src/slots.c src/group.c src/engine.c
+OBJ = $(CORE:src/%.c=$(BUILD)/%.o)
+ifeq ($(shell uname -s),Darwin)
+ASAN_ENV = detect_leaks=0
+else
+ASAN_ENV = detect_leaks=1
+endif
+.PHONY: test-console test-final all test asan tsan test-small-order test-crash test-queue test-lifecycle bench bench-server clean
+all: $(BUILD)/mini-db-console $(BUILD)/mini-db $(BUILD)/mini-db-server $(BUILD)/libmdb.a
+$(BUILD):
+	mkdir -p $@
+$(BUILD)/%.o: src/%.c include/mdb.h include/bpt.h include/binary.h include/slots.h include/group.h src/analytics.inc | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+$(BUILD)/mini-db: $(OBJ) $(BUILD)/cli.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+$(BUILD)/mini-db-server: $(OBJ) $(BUILD)/server.o $(BUILD)/query_json.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+$(BUILD)/libmdb.a: $(OBJ) $(BUILD)/query_json.o
+	$(AR) rcs $@ $^
+$(BUILD)/test-%: tests/test_%.c $(OBJ) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(OBJ) $(LDLIBS) -o $@
+$(BUILD)/test-engine: tests/test_engine.c $(CORE) include/mdb.h include/bpt.h include/binary.h include/slots.h include/group.h src/analytics.inc | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_TESTING tests/test_engine.c $(CORE) $(LDLIBS) -o $@
+$(BUILD)/test-bpt: tests/test_bpt.c src/bpt.c include/bpt.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_BPT_TEST_ALLOC tests/test_bpt.c src/bpt.c $(LDLIBS) -o $@
+$(BUILD)/test-slots: tests/test_slots.c src/slots.c include/slots.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_SLOTS_TEST_ALLOC tests/test_slots.c src/slots.c $(LDLIBS) -o $@
+$(BUILD)/test-group: tests/test_group.c src/group.c src/common.c include/group.h include/mdb.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_GROUP_TESTING tests/test_group.c src/group.c src/common.c $(LDLIBS) -o $@
+$(BUILD)/test-group-collisions: tests/test_group.c src/group.c src/common.c include/group.h include/mdb.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_GROUP_TESTING -DMDB_GROUP_TEST_COLLISIONS tests/test_group.c src/group.c src/common.c $(LDLIBS) -o $@
+$(BUILD)/test-protocol: tests/test_protocol.c $(OBJ) $(BUILD)/query_json.o | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(OBJ) $(BUILD)/query_json.o $(LDLIBS) -o $@
+test: test-console test-final test-queue test-lifecycle all $(BUILD)/test-sql $(BUILD)/test-bpt $(BUILD)/test-engine $(BUILD)/test-protocol $(BUILD)/test-binary $(BUILD)/test-slots $(BUILD)/test-group $(BUILD)/test-group-collisions
+	./$(BUILD)/test-sql
+	./$(BUILD)/test-bpt
+	./$(BUILD)/test-engine
+	./$(BUILD)/test-protocol
+	./$(BUILD)/test-binary
+	./$(BUILD)/test-slots
+	./$(BUILD)/test-group
+	./$(BUILD)/test-group-collisions
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_binary_storage.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_group_by.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/integration.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_create_table.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_unique_index.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/corruption.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/io_failures.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/model.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_server.py
+asan:
+	ASAN_OPTIONS=$(ASAN_ENV) $(MAKE) BUILD=build/asan CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer' test test-crash test-small-order
+tsan:
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) BUILD=build/tsan CFLAGS='-std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -fsanitize=thread -fno-omit-frame-pointer' test test-small-order
+test-small-order: | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DBPT_ORDER=4 -DMDB_BPT_TEST_ALLOC tests/test_bpt.c src/bpt.c $(LDLIBS) -o $(BUILD)/test-bpt-small
+	./$(BUILD)/test-bpt-small
+test-crash: all
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/crash.py
+bench: all
+	python3 tools/bench.py --count 1000000
+bench-server: all
+	python3 tools/bench_server.py
+$(BUILD)/bench: tools/bench.c $(OBJ) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(OBJ) $(LDLIBS) -o $@
+clean:
+	rm -rf build
+
+$(BUILD)/mini-db-server-test: src/server.c src/query_json.c $(CORE) include/mdb.h include/bpt.h include/binary.h include/slots.h include/group.h src/analytics.inc | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_TESTING src/server.c src/query_json.c $(CORE) $(LDLIBS) -o $@
+test-queue: all $(BUILD)/mini-db-server-test
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER_TEST="$(CURDIR)/$(BUILD)/mini-db-server-test" python3 tests/test_queue.py
+
+$(BUILD)/mini-db-server-lifecycle: src/server.c src/query_json.c $(CORE) include/mdb.h include/bpt.h include/binary.h include/slots.h include/group.h src/analytics.inc | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_TESTING -DSESSION_TTL=1 src/server.c src/query_json.c $(CORE) $(LDLIBS) -o $@
+test-lifecycle: all $(BUILD)/mini-db-server-lifecycle
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER_LIFECYCLE="$(CURDIR)/$(BUILD)/mini-db-server-lifecycle" python3 tests/test_lifecycle.py
+
+$(BUILD)/mini-db-console: $(OBJ) $(BUILD)/console.o $(BUILD)/console_core.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+$(BUILD)/test-console-core: tests/test_console_core.c $(BUILD)/console_core.o $(BUILD)/common.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDLIBS) -o $@
+test-console: $(BUILD)/mini-db-console $(BUILD)/test-console-core
+	./$(BUILD)/test-console-core
+	MDB_CONSOLE="$(CURDIR)/$(BUILD)/mini-db-console" python3 tests/test_console.py
+
+$(BUILD)/test-locking: tests/test_locking.c $(CORE) include/mdb.h src/analytics.inc | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMDB_TESTING tests/test_locking.c $(CORE) $(LDLIBS) -o $@
+test-final: all $(BUILD)/test-locking
+	./$(BUILD)/test-locking
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_analytics.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_final_features.py
+
+test-demo: all
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_demo.py
