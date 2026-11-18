@@ -27,6 +27,7 @@ typedef enum {
     T_LP,
     T_RP,
     T_COMMA,
+    T_DOT,
     T_STAR,
     T_SEMI,
     T_EQ,
@@ -198,6 +199,9 @@ static void advance(parser *p) {
         case ',':
             t.kind = T_COMMA;
             break;
+        case '.':
+            t.kind = T_DOT;
+            break;
         case '*':
             t.kind = T_STAR;
             break;
@@ -272,6 +276,20 @@ static char *identifier(parser *p) {
     advance(p);
     return result;
 }
+static char *column_reference(parser *p) {
+    char *left = identifier(p);
+    if (!left || !take(p, T_DOT))
+        return left;
+    const char *right = identifier(p);
+    if (!right)
+        return NULL;
+    size_t length = strlen(left) + strlen(right) + 2;
+    char *name = allocate(p, length);
+    if (name)
+        (void)snprintf(name, length, "%s.%s", left, right);
+    return name;
+}
+
 static int literal(parser *p, mdb_value *out) {
     if (p->failed)
         return 0;
@@ -292,7 +310,7 @@ static int literal(parser *p, mdb_value *out) {
 static int operand(parser *p, mdb_operand *out) {
     if (p->current.kind == T_IDENT) {
         out->is_column = 1;
-        out->column = identifier(p);
+        out->column = column_reference(p);
         return !p->failed;
     }
     return literal(p, &out->value);
@@ -403,7 +421,7 @@ static int column_list(parser *p, mdb_stmt *s) {
  * into an aggregate expression, and this grammar accepts only COUNT(*). */
 static int select_item(parser *p, char **column, int *count) {
     *count = 0;
-    *column = identifier(p);
+    *column = column_reference(p);
     if (!*column)
         return 0;
     if (p->current.kind != T_LP)
@@ -416,7 +434,7 @@ static int select_item(parser *p, char **column, int *count) {
     if (function == 1) {
         if (!require(p, T_STAR, "COUNT requires *")) return 0;
     } else {
-        *column = identifier(p);
+        *column = column_reference(p);
         if (!*column) return 0;
     }
     if (!require(p, T_RP, "Expected ')' after function")) return 0;
@@ -449,6 +467,22 @@ static int select_list(parser *p, mdb_stmt *s) {
     s->count = s->ncolumns == 1 && s->column_counts[0] == 1;
     return !p->failed;
 }
+static char *table_alias(parser *p) {
+    if (keyword(p, "as")) {
+        advance(p);
+        return identifier(p);
+    }
+    static const char *clauses[] = {"where", "group", "order", "limit", "offset", "for",
+                                    "having", "join", "inner", "left", "right", "full",
+                                    "outer", "cross", "natural", "on", "union"};
+    if (p->current.kind != T_IDENT)
+        return NULL;
+    for (size_t i = 0; i < sizeof(clauses) / sizeof(*clauses); i++)
+        if (keyword(p, clauses[i]))
+            return NULL;
+    return identifier(p);
+}
+
 static void parse_select(parser *p, mdb_stmt *s) {
     s->kind = MDB_SELECT;
     advance(p);
@@ -461,6 +495,23 @@ static void parse_select(parser *p, mdb_stmt *s) {
     s->table = identifier(p);
     if (p->failed)
         return;
+    s->table_alias = table_alias(p);
+    if (keyword(p, "inner") || keyword(p, "join")) {
+        if (keyword(p, "inner"))
+            advance(p);
+        if (!require_word(p, "join"))
+            return;
+        s->join_table = identifier(p);
+        s->join_alias = table_alias(p);
+        if (p->failed || !require_word(p, "on"))
+            return;
+        s->join_a = column_reference(p);
+        if (!s->join_a || !require(p, T_EQ, "JOIN requires ON column = column"))
+            return;
+        s->join_b = column_reference(p);
+        if (!s->join_b)
+            return;
+    }
     if (keyword(p, "where")) {
         advance(p);
         s->where = expression(p);
@@ -533,6 +584,10 @@ static void parse_select(parser *p, mdb_stmt *s) {
     if (keyword(p, "for")) {
         advance(p);
         if (!require_word(p, "update")) return;
+        if (s->join_table) {
+            (void)fail(p, MDB_SYNTAX, p->current.offset, "JOIN does not support FOR UPDATE");
+            return;
+        }
         s->for_update = 1;
         for (size_t i = 0; i < s->ncolumns; i++)
             if (s->column_counts[i] && s->column_counts[i] != 6)

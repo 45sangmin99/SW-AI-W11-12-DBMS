@@ -70,6 +70,9 @@ typedef struct {
     column cols[MDB_COL_MAX];
     size_t ncols;
     uint64_t schemahash, basehash, next_id, reserved;
+    /* Set only on a statement-local schema for SELECT aliases and JOIN. */
+    const char *source_names[2];
+    size_t right_start;
 } tabledef;
 typedef struct {
     size_t refs, record_size;
@@ -537,11 +540,36 @@ static int find_table(mdb_db *db, const char *name) {
             return (int)i;
     return -1;
 }
+static int qualifier_matches(const char *name, const char *dot, const char *qualifier) {
+    size_t length = (size_t)(dot - name);
+    return strlen(qualifier) == length && !memcmp(name, qualifier, length);
+}
 static int find_column(const tabledef *t, const char *name) {
-    for (size_t i = 0; i < t->ncols; i++)
-        if (strcmp(t->cols[i].name, name) == 0)
-            return (int)i;
-    return -1;
+    size_t start = 0, end = t->ncols;
+    const char *dot = strchr(name, '.');
+    if (dot) {
+        const char *left = t->source_names[0] ? t->source_names[0] : t->name;
+        if (qualifier_matches(name, dot, left))
+            end = t->source_names[1] ? t->right_start : end;
+        else if (t->source_names[1] && qualifier_matches(name, dot, t->source_names[1]))
+            start = t->right_start;
+        else return -1;
+        name = dot + 1;
+    }
+    int position = -1;
+    for (size_t i = start; i < end; i++) {
+        if (strcmp(t->cols[i].name, name))
+            continue;
+        if (position >= 0)
+            return -2;
+        position = (int)i;
+        if (!t->source_names[1]) break;
+    }
+    return position;
+}
+static int column_error(mdb_error *e, int position, const char *message) {
+    return fail(e, MDB_UNKNOWN_COLUMN,
+                position == -2 ? "Ambiguous column; qualify it with a table name or alias" : message);
 }
 static int create_definition(const mdb_stmt *st, tabledef *t, mdb_error *e) {
     if (st->kind != MDB_CREATE || !valid_name(st->table) || !st->ncolumns)
@@ -2296,7 +2324,7 @@ static int operand_type(const tabledef *t, const mdb_operand *o, mdb_type *type,
     if (o->is_column) {
         int i = find_column(t, o->column);
         if (i < 0)
-            return fail(e, MDB_UNKNOWN_COLUMN, "Unknown column");
+            return column_error(e, i, "Unknown column");
         *type = t->cols[i].type;
     } else {
         *type = o->value.type;
@@ -2545,7 +2573,7 @@ static int group_prepare(mdb_db *db, const tabledef *t, const mdb_stmt *st,
     for (size_t i = 0; i < st->ngroup_by; i++) {
         int col = find_column(t, st->group_by[i]);
         if (col < 0)
-            return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown GROUP BY column");
+            return column_error(&out->error, col, "Unknown GROUP BY column");
         if (group_key(positions, i, col) >= 0)
             return fail(&out->error, MDB_COLUMN_COUNT, "Duplicate GROUP BY column");
         positions[i] = col;
@@ -2563,7 +2591,7 @@ static int group_prepare(mdb_db *db, const tabledef *t, const mdb_stmt *st,
         } else {
             int col = st->star ? (int)i : find_column(t, st->columns[i]);
             if (col < 0)
-                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown SELECT column");
+                return column_error(&out->error, col, "Unknown SELECT column");
             int key = group_key(positions, st->ngroup_by, col);
             if (key < 0)
                 return fail(&out->error, MDB_SYNTAX,
@@ -2586,7 +2614,7 @@ static int group_prepare(mdb_db *db, const tabledef *t, const mdb_stmt *st,
         else {
             int col = find_column(t, st->order[i].column);
             if (col < 0)
-                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown ORDER BY column");
+                return column_error(&out->error, col, "Unknown ORDER BY column");
             int key = group_key(positions, st->ngroup_by, col);
             if (key < 0)
                 return fail(&out->error, MDB_SYNTAX,
@@ -2750,7 +2778,7 @@ static int result_columns(mdb_result *out, const tabledef *t, const mdb_stmt *st
         } else {
             int col = st->star ? (int)i : find_column(t, st->columns[i]);
             if (col < 0)
-                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown SELECT column");
+                return column_error(&out->error, col, "Unknown SELECT column");
             positions[i] = col;
             out->columns[i] = strdup(t->cols[col].name);
             out->types[i] = t->cols[col].type;
@@ -2764,6 +2792,119 @@ static int result_columns(mdb_result *out, const tabledef *t, const mdb_stmt *st
     }
     return 0;
 }
+typedef struct {
+    const view *snapshot_view;
+    const overlay *changes;
+    size_t slot, change;
+} join_cursor;
+
+/* Borrow rows from the pinned snapshot and this session's own overlay. */
+static const row *join_next(join_cursor *cursor) {
+    while (cursor->slot < cursor->snapshot_view->n) {
+        const row *r = view_row(cursor->snapshot_view, cursor->slot++);
+        if (!r)
+            continue;
+        size_t index;
+        if (!map_get(&cursor->changes->map, r->v[0].i, &index))
+            return r;
+        const change *c = &cursor->changes->v[index];
+        if (!c->deleted)
+            return c->value;
+    }
+    while (cursor->change < cursor->changes->n) {
+        const change *c = &cursor->changes->v[cursor->change++];
+        if (c->inserted && !c->deleted)
+            return c->value;
+    }
+    return NULL;
+}
+
+typedef struct {
+    const row *value;
+    const mdb_value *key;
+    size_t sequence;
+} join_entry;
+
+static int join_compare(const void *a, const void *b) {
+    const join_entry *left = a, *right = b;
+    int key_order = value_cmp(left->key, right->key);
+    if (key_order)
+        return key_order;
+    return (left->sequence > right->sequence) - (left->sequence < right->sequence);
+}
+
+static size_t join_lower_bound(const join_entry *entries, size_t count, const mdb_value *key) {
+    size_t first = 0;
+    while (first < count) {
+        size_t middle = first + (count - first) / 2;
+        if (value_cmp(entries[middle].key, key) < 0)
+            first = middle + 1;
+        else
+            count = middle;
+    }
+    return first;
+}
+
+static int join_visit(selection *found, const row *left, const row *right, size_t split) {
+    size_t ncols = found->table->ncols;
+    row *combined = row_new(ncols);
+    if (!combined)
+        return fail(found->error, MDB_NOMEM, "JOIN row allocation failed");
+    for (size_t i = 0; i < ncols; i++) {
+        const mdb_value *source = i < split ? &left->v[i] : &right->v[i - split];
+        if (mdb_value_copy(&combined->v[i], source)) {
+            row_drop(combined, ncols);
+            return fail(found->error, MDB_NOMEM, "JOIN row allocation failed");
+        }
+    }
+    return select_visit(found, combined);
+}
+
+/* Sort right-side keys once, then probe for each visible left-side row. */
+static int select_join(mdb_db *db, transaction *tx, size_t left_table, size_t right_table,
+                       int left_key, int right_key, selection *found) {
+    join_cursor left = {.snapshot_view = tx->snap->tables[left_table], .changes = &tx->tables[left_table]};
+    join_cursor right = {.snapshot_view = tx->snap->tables[right_table], .changes = &tx->tables[right_table]};
+    const row *left_row = join_next(&left);
+    if (!left_row)
+        return 0;
+    join_entry *entries = NULL;
+    size_t count = 0, capacity = 0;
+    int rc = -1;
+    const row *right_row;
+    while ((right_row = join_next(&right))) {
+        if (count >= db->max_sort_rows) {
+            fail(found->error, MDB_LIMIT, "JOIN workspace limit reached");
+            goto done;
+        }
+        if (grow((void **)&entries, &capacity, count + 1, sizeof *entries)) {
+            fail(found->error, MDB_NOMEM, "JOIN workspace allocation failed");
+            goto done;
+        }
+        entries[count] = (join_entry){right_row, &right_row->v[right_key], count};
+        count++;
+    }
+    if (count > 1)
+        qsort(entries, count, sizeof *entries, join_compare);
+    rc = 0;
+    if (count == 0)
+        goto done;
+    do {
+        const mdb_value *key = &left_row->v[left_key];
+        for (size_t i = join_lower_bound(entries, count, key);
+             i < count && value_cmp(entries[i].key, key) == 0; i++) {
+            int visit = join_visit(found, left_row, entries[i].value, found->table->right_start);
+            if (visit) {
+                rc = visit < 0 ? -1 : 0;
+                goto done;
+            }
+        }
+    } while ((left_row = join_next(&left)));
+done:
+    free(entries);
+    return rc;
+}
+
 static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt *st,
                           mdb_result *out) {
 #ifdef MDB_TESTING
@@ -2778,7 +2919,39 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
 #endif
     if (st->limit > MDB_RESULT_MAX)
         return fail(&out->error, MDB_LIMIT, "LIMIT exceeds maximum result rows (10000)");
-    tabledef *t = &db->defs[ti];
+    const tabledef *t = &db->defs[ti];
+    tabledef scoped;
+    int right_table = -1, left_key = 0, right_key = 0;
+    if (st->join_table || st->table_alias) {
+        scoped = *t;
+        scoped.source_names[0] = st->table_alias ? st->table_alias : st->table;
+        t = &scoped;
+    }
+    if (st->join_table) {
+        right_table = find_table(db, st->join_table);
+        if (right_table < 0)
+            return fail(&out->error, MDB_UNKNOWN_TABLE, "Unknown JOIN table");
+        const tabledef *right = &db->defs[right_table];
+        if (scoped.ncols + right->ncols > MDB_COL_MAX)
+            return fail(&out->error, MDB_LIMIT, "JOIN input exceeds the combined column limit (32)");
+        scoped.source_names[1] = st->join_alias ? st->join_alias : st->join_table;
+        if (!strcmp(scoped.source_names[0], scoped.source_names[1]))
+            return fail(&out->error, MDB_SYNTAX, "JOIN requires distinct table names or aliases");
+        scoped.right_start = scoped.ncols;
+        memcpy(scoped.cols + scoped.ncols, right->cols, right->ncols * sizeof *right->cols);
+        scoped.ncols += right->ncols;
+        int a = find_column(t, st->join_a), b = find_column(t, st->join_b);
+        if (a < 0 || b < 0)
+            return column_error(&out->error, a < 0 ? a : b, "Unknown JOIN column");
+        int a_on_right = (size_t)a >= scoped.right_start;
+        int b_on_right = (size_t)b >= scoped.right_start;
+        if (a_on_right == b_on_right)
+            return fail(&out->error, MDB_SYNTAX, "JOIN ON must compare a column from each table");
+        if (scoped.cols[a].type != scoped.cols[b].type)
+            return fail(&out->error, MDB_TYPE, "JOIN column type mismatch");
+        left_key = a_on_right ? b : a;
+        right_key = (a_on_right ? a : b) - (int)scoped.right_start;
+    }
     if (expr_valid(t, st->where, &out->error))
         return -1;
     int extended = analytics_needed(st);
@@ -2824,8 +2997,11 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
                 if (!st->count)
                     return fail(&out->error, MDB_SYNTAX,
                                 "ORDER BY COUNT(*) requires grouping or COUNT(*) projection");
-            } else if (find_column(t, st->order[i].column) < 0)
-                return fail(&out->error, MDB_UNKNOWN_COLUMN, "Unknown ORDER BY column");
+            } else {
+                int col = find_column(t, st->order[i].column);
+                if (col < 0)
+                    return column_error(&out->error, col, "Unknown ORDER BY column");
+            }
         }
         if (result_columns(out, t, st, positions))
             return -1;
@@ -2837,13 +3013,16 @@ static int execute_select(mdb_db *db, transaction *tx, size_t ti, const mdb_stmt
     int rc = -1;
     int64_t id;
     const char *force = getenv("MDB_FORCE_SCAN");
-    int indexed = !(force && strcmp(force, "0")) && mdb_expr_id(st->where, &id);
+    int indexed = right_table < 0 && !(force && strcmp(force, "0")) && mdb_expr_id(st->where, &id);
     out->used_index = indexed;
     if (!extended && st->limit == 0 && (!st->count || st->ngroup_by)) {
         rc = 0;
         goto done;
     }
-    if (indexed) {
+    if (right_table >= 0) {
+        if (select_join(db, tx, ti, (size_t)right_table, left_key, right_key, &found))
+            goto done;
+    } else if (indexed) {
         uint64_t offset; /* Always execute the real tree search, including for own inserted rows. */
         int exists = view_search(v, id, &offset);
         row *r = NULL;

@@ -95,6 +95,7 @@ $(BUILD)/test-locking: tests/test_locking.c $(CORE) include/mdb.h src/analytics.
 test-final: all $(BUILD)/test-locking
 	./$(BUILD)/test-locking
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_analytics.py
+	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" python3 tests/test_join.py
 	MDB_CLI="$(CURDIR)/$(BUILD)/mini-db" MDB_SERVER="$(CURDIR)/$(BUILD)/mini-db-server" python3 tests/test_final_features.py
 
 test-demo: all

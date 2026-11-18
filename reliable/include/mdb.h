@@ -72,7 +72,9 @@ typedef struct {
 } mdb_assignment;
 typedef struct {
     mdb_stmt_kind kind;
-    char *table;
+    char *table, *table_alias;
+    char *join_table, *join_alias;
+    char *join_a, *join_b; /* Column references on either side of ON =. */
     char **columns;
     size_t ncolumns;
     char **aliases; /* Explicit SELECT AS aliases; ORDER BY resolves these first. */

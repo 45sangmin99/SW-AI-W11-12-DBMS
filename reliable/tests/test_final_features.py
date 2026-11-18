@@ -83,6 +83,19 @@ def main():
             q('UPDATE characters SET attack=34 WHERE id=1', a)
             assert q('SELECT attack FROM characters WHERE id=1', a)['rows'] == [['34']]
             q('ROLLBACK', a)
+            # Both sides of JOIN retain the same old snapshot after a multi-table commit.
+            q("INSERT INTO items VALUES ('seed',33)")
+            joined = ('SELECT c.name, i.name FROM characters c JOIN items i '
+                      'ON c.attack=i.price ORDER BY c.id,i.id')
+            q('BEGIN', a)
+            assert q(joined, a)['rows'] == [['a', 'seed']]
+            q('BEGIN', b)
+            q("UPDATE characters SET name='new name' WHERE id=1", b)
+            q("UPDATE items SET name='new item' WHERE price=33", b)
+            q('COMMIT', b)
+            assert q(joined, a)['rows'] == [['a', 'seed']]
+            assert q(joined)['rows'] == [['new name', 'new item']]
+            q('ROLLBACK', a)
             # Known holder + actual submitted waiter, no assumption about accepted sockets.
             q('BEGIN', a); q('BEGIN', b)
             q('SELECT attack FROM characters WHERE id=1 FOR UPDATE', a)
