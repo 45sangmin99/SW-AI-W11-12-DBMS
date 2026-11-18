@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="610" viewBox="0 0 920 610" role="img" aria-labelledby="title desc">
+<title id="title">WAL 커밋과 장애 복구</title>
+<desc id="desc">Client 요청으로 변경 A=150을 WAL에 기록하고 fsync 후, 데이터 파일 A=100인 상태에서 장애 발생. 재시작한 DBMS가 WAL의 커밋된 변경을 읽고 데이터 파일에 적용해 A=150으로 복구한다.</desc>
+<defs>
+<marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#1a1a1a"/></marker>
+<style><![CDATA[
+  .label { font: 600 21px -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; fill:#171717; }
+  .msg { font: 18px -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; fill:#171717; }
+  .sub { font: 17px -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; fill:#5c5c5c; }
+  .state { font: 600 21px ui-monospace,SFMono-Regular,Menlo,monospace; fill:#1a1a1a; }
+  .life { stroke:#b3b3b3; stroke-width:1.5; stroke-dasharray:5 6; }
+  .arrow { stroke:#202020;stroke-width:1.8;fill:none;marker-end:url(#head); }
+]]></style>
+</defs>
+<rect width="920" height="610" fill="#fff"/>
+<!-- participant names -->
+<text x="91" y="45" text-anchor="middle" class="label">Client</text>
+<text x="313" y="45" text-anchor="middle" class="label">DBMS</text>
+<text x="568" y="45" text-anchor="middle" class="label">WAL</text>
+<text x="809" y="45" text-anchor="middle" class="label">Data file</text>
+<line x1="91" y1="64" x2="91" y2="572" class="life"/>
+<line x1="313" y1="64" x2="313" y2="572" class="life"/>
+<line x1="568" y1="64" x2="568" y2="572" class="life"/>
+<line x1="809" y1="64" x2="809" y2="572" class="life"/>
+<!-- initial data-state -->
+<rect x="739" y="87" width="140" height="39" rx="4" fill="#fff" stroke="#777"/>
+<text x="809" y="113" text-anchor="middle" class="state">A = 100</text>
+<!-- update command -->
+<line x1="101" y1="164" x2="301" y2="164" class="arrow"/>
+<text x="201" y="147" text-anchor="middle" class="msg">UPDATE A=150</text>
+<!-- wal contains change itself -->
+<line x1="325" y1="233" x2="556" y2="233" class="arrow"/>
+<text x="440" y="214" text-anchor="middle" class="msg">A=150, COMMIT</text>
+<!-- durability -->
+<line x1="325" y1="302" x2="556" y2="302" class="arrow"/>
+<text x="440" y="284" text-anchor="middle" class="msg">fsync()</text>
+<!-- crash moment -->
+<line x1="154" y1="371" x2="895" y2="371" stroke="#555" stroke-dasharray="9 7" stroke-width="1.5"/>
+<rect x="32" y="355" width="109" height="30" fill="#fff"/>
+<text x="39" y="376" class="label">CRASH</text>
+<rect x="723" y="339" width="166" height="27" fill="#fff"/>
+<text x="806" y="358" text-anchor="middle" class="sub">still A=100</text>
+<!-- restart and replay -->
+<text x="313" y="408" text-anchor="middle" class="sub">restart</text>
+<line x1="556" y1="451" x2="325" y2="451" class="arrow"/>
+<text x="440" y="433" text-anchor="middle" class="msg">A=150, COMMIT</text>
+<line x1="325" y1="513" x2="797" y2="513" class="arrow"/>
+<text x="560" y="494" text-anchor="middle" class="msg">REDO: apply A=150</text>
+<rect x="739" y="544" width="140" height="39" rx="4" fill="#fff" stroke="#777"/>
+<text x="809" y="570" text-anchor="middle" class="state">A = 150</text>
+</svg>
