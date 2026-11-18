@@ -44,7 +44,21 @@ FROM events GROUP BY MONTH(created) ORDER BY month;
 
 MONTH는 Unix epoch **초** INT를 UTC의 YYYY-MM으로 바꿔 묶습니다. 0001~9999년 범위이며 운영체제 time_t가 표현하지 못하는 시각은 오류입니다. 밀리초·문자열 날짜·시간대·DATE_TRUNC는 지원하지 않습니다. MONTH는 현재 GROUP BY 표현식과 그 출력에 사용합니다. 확장 집계의 ORDER BY는 출력한 표현식 또는 AS 별칭을 사용합니다. GROUP BY에서 AS 별칭은 지원하지 않습니다. 그룹별 작업 공간은 `MDB_MAX_GROUPS`로 제한합니다.
 
-기간 WHERE는 기존 정수 비교로 처리합니다. 급증 판정은 기간별 집계 결과를 애플리케이션에서 비교해야 합니다. 윈도 함수, HAVING, JOIN, 하위 질의는 구현하지 않았습니다.
+기간 WHERE는 기존 정수 비교로 처리합니다. 급증 판정은 기간별 집계 결과를 애플리케이션에서 비교해야 합니다. 윈도 함수, HAVING, 하위 질의는 구현하지 않았습니다.
+
+## 테이블 결합
+
+`JOIN`과 `INNER JOIN`은 같은 자료형의 열을 비교해 두 테이블을 결합합니다. 일치하는 행의 쌍마다 결과가 하나씩 생성됩니다. 두 테이블에 같은 열 이름이 있으면 테이블 이름이나 별칭으로 구분합니다.
+
+```sql
+SELECT c.name AS character_name, i.name AS item_name
+FROM characters AS c
+INNER JOIN items AS i ON c.attack = i.price
+WHERE i.price >= 10
+ORDER BY c.id, i.id;
+```
+
+두 입력은 같은 트랜잭션 스냅샷과 세션의 아직 커밋하지 않은 변경을 읽습니다. 기존 `WHERE`, `GROUP BY`, 집계, `ORDER BY`, `LIMIT`과 `OFFSET`을 함께 사용할 수 있습니다. 자기 조인에는 서로 다른 별칭을 사용합니다. 입력 열은 두 테이블을 합쳐 최대 32개이며, 오른쪽 입력의 정렬 작업 공간은 `MDB_MAX_SORT_ROWS` 행으로 제한합니다. 지원 범위는 단일 동등 조건의 내부 조인입니다.
 
 ## 페이지 조회
 
@@ -90,3 +104,5 @@ Apple M2, Darwin 25.5.0(ARM64), Apple clang 21.0.0, Python 3.9.6, Node.js 24.16.
 | 선택 DOM 검사 | 기존 Mini React 저장소의 jsdom을 사용해 mount, 클릭 이벤트, 재고 갱신 3회, 주문 목록, 품절 버튼 통과. 실제 브라우저 시각 검사와 구분 |
 
 실행 로그는 로컬 `build/final-tests.log`, `build/final-asan.log`에 있습니다. 빌드 산출물과 로그는 Git에서 제외합니다. 변경 전 OCC의 WSL 측정값을 현재 엔진의 측정값으로 옮기지 않았습니다.
+
+스냅샷 조회와 비교용 2PL의 실측은 [동시성 제어 성능 비교](isolation-comparison.md)에 별도로 정리했습니다.

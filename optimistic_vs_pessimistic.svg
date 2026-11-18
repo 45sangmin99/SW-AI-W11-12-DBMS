@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="295" viewBox="0 0 920 295" role="img" aria-labelledby="title description">
+  <title id="title">Pessimistic vs Optimistic Concurrency Control</title>
+  <desc id="description">Two transactions update the same row. Under pessimistic locking, T2 waits until T1 commits, so its work and successful completion shift to the right. With optimistic concurrency, T2 performs work in parallel with T1 but detects a conflict at commit and aborts earlier.</desc>
+  <rect width="920" height="295" fill="#ffffff"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#202020">
+    <text x="32" y="32" font-size="20" font-weight="700">Pessimistic</text>
+    <text x="32" y="171" font-size="20" font-weight="700">Optimistic</text>
+    <text x="888" y="31" font-size="12" fill="#777777" text-anchor="end">same row</text>
+    <g font-size="15" text-anchor="end">
+      <text x="92" y="77">T1</text>
+      <text x="92" y="116">T2</text>
+      <text x="92" y="216">T1</text>
+      <text x="92" y="255">T2</text>
+    </g>
+  </g>
+  <g fill="none" stroke="#e5e5e5" stroke-width="1.25">
+    <path d="M114 68 H890 M114 107 H890 M114 207 H890 M114 246 H890"/>
+    <path d="M32 148 H888"/>
+  </g>
+  <!-- Identical T1 timeline for both policies. -->
+  <g fill="#202020">
+    <rect x="145" y="53" width="315" height="30" rx="2"/>
+    <rect x="145" y="192" width="315" height="30" rx="2"/>
+  </g>
+  <!-- Pessimistic: T2 attempts access at x=270, waits for T1's lock until x=460,
+       then performs 295 units of work and completes at x=755. -->
+  <rect x="270" y="92" width="190" height="30" rx="2" fill="#ffffff" stroke="#777777" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="365" y="112" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#444444" text-anchor="middle">WAIT</text>
+  <rect x="460" y="92" width="295" height="30" rx="2" fill="#757575"/>
+  <!-- Optimistic: same amount of T2 work begins immediately, but fails validation. -->
+  <rect x="270" y="231" width="295" height="30" rx="2" fill="#757575"/>
+  <!-- Outcomes: T1 succeeds in both cases; T2 succeeds only after waiting in 2PL. -->
+  <g fill="none" stroke="#202020" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M472 68 l6 6 l12 -14"/>
+    <path d="M767 107 l6 6 l12 -14"/>
+    <path d="M472 207 l6 6 l12 -14"/>
+    <path d="M579 238 l13 16 M592 238 l-13 16"/>
+  </g>
+</svg>
